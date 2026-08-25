@@ -18,6 +18,21 @@ ARG OPENMW_WEB_VERSION=v1.1.0
 ADD https://github.com/Virtastic/openmw-web/releases/download/${OPENMW_WEB_VERSION}/openmw-web-${OPENMW_WEB_VERSION}.zip /tmp/openmw-web.zip
 RUN python -m zipfile -e /tmp/openmw-web.zip /app && rm /tmp/openmw-web.zip
 
+# Overlay this branch's patched game page (server-curated load order support) onto the
+# release. The release build stamps __ENGINE_VERSION__ with the content hash of the
+# engine dir (e/<hash>/) and rewrites the streamfs.js script src to the versioned path;
+# reproduce both here so the patched page addresses the same engine files. Any stale
+# precompressed sibling must go, or server.py would serve the unpatched .br instead.
+COPY play/index.html /tmp/index.html.in
+RUN set -e; \
+    ENGVER=$(ls /app/e); \
+    sed -e "s/__ENGINE_VERSION__/${ENGVER}/g" \
+        -e "s|src=\"streamfs.js\"|src=\"e/${ENGVER}/streamfs.js\"|" \
+        /tmp/index.html.in > /app/index.html; \
+    rm -f /app/index.html.br /tmp/index.html.in; \
+    grep -q "e/${ENGVER}/streamfs.js" /app/index.html; \
+    grep -q "__momwCfg" /app/index.html
+
 WORKDIR /app
 
 # OPENMW_HOST: bind all interfaces (container). OPENMW_OPEN: don't try to open a browser.
