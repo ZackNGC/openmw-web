@@ -1,0 +1,19 @@
+# Dokploy compose for openmw-web (single-player, server-hosted game data).
+# Create a "Compose" service in Dokploy pointing at this repo/branch with
+# compose path dokploy/docker-compose.yml, then attach a domain (HTTPS is
+# mandatory: the engine needs cross-origin isolation, which browsers only
+# grant on secure origins) targeting service "morrowind" port 8910.
+services:
+  morrowind:
+    build:
+      context: ..
+      dockerfile: dokploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      - OPENMW_LAUNCHER=1
+    volumes:
+      # Stage your own legally-owned Morrowind Data Files (plus Tamriel Rebuilt,
+      # texture packs, etc.) on the host. Nothing is bundled in the image.
+      - /opt/morrowind/mwdata:/app/mwdata:ro
+    expose:
+      - "8910"
