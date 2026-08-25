@@ -1,8 +1,10 @@
 # Dokploy compose for openmw-web (single-player, server-hosted game data).
-# Create a "Compose" service in Dokploy pointing at this repo/branch with
-# compose path dokploy/docker-compose.yml, then attach a domain (HTTPS is
-# mandatory: the engine needs cross-origin isolation, which browsers only
-# grant on secure origins) targeting service "morrowind" port 8910.
+#
+# Routing is done with Traefik labels (Dokploy's edge proxy runs on the external
+# "dokploy-network"), matching the pattern the other apps on this host use.
+# HTTPS is mandatory: the engine is multi-threaded WASM and needs cross-origin
+# isolation, which browsers only grant on secure origins. server.py sends the
+# COOP/COEP/CORP isolation headers itself.
 services:
   morrowind:
     build:
@@ -10,10 +12,23 @@ services:
       dockerfile: dokploy/Dockerfile
     restart: unless-stopped
     environment:
-      - OPENMW_LAUNCHER=1
+      OPENMW_HOST: 0.0.0.0
+      OPENMW_OPEN: "0"
+      OPENMW_LAUNCHER: "1"
+      PORT: "8910"
     volumes:
-      # Stage your own legally-owned Morrowind Data Files (plus Tamriel Rebuilt,
-      # texture packs, etc.) on the host. Nothing is bundled in the image.
+      # Your own legally-owned Data Files (base game + Tribunal/Bloodmoon) plus
+      # Tamriel Rebuilt and Tamriel_Data HD. Staged on the host; never bundled.
       - /opt/morrowind/mwdata:/app/mwdata:ro
-    expose:
-      - "8910"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.morrowind.rule=Host(`morrowind.saisoft.works`)"
+      - "traefik.http.routers.morrowind.entrypoints=web,websecure"
+      - "traefik.http.routers.morrowind.tls.certresolver=letsencrypt"
+      - "traefik.http.services.morrowind.loadbalancer.server.port=8910"
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
