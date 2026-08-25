@@ -1905,10 +1905,78 @@
          modBsa.forEach(function(a){ fbarch.push(a); });
          modEsm.forEach(function(c){ content.push(c); });
          modEsp.forEach(function(c){ content.push(c); });
-         var mods=modEsm.concat(modEsp);
-         if (mods.length) append('[data] + '+mods.length+' mod plugin(s): '+mods.join(', '));
-         return { content: content, fbarch: fbarch };
-       }
+        var mods=modEsm.concat(modEsp);
+        if (mods.length) append('[data] + '+mods.length+' mod plugin(s): '+mods.join(', '));
+        return { content: content, fbarch: fbarch };
+      }
+
+      // --- Curated load order (openmw-web.cfg staged inside the data set) ------------------
+      // A REAL mod list (e.g. a flattened modding-openmw.com pack) needs a precise content
+      // order, groundcover= entries and fallback overrides — none of which buildLoadOrder's
+      // alphabetical scan can express (grass plugins loaded as content= render as solid
+      // clutter). Both data paths (server-hosted mwdata/ AND a locally picked folder) honor
+      // the file when present; ?nomods=1 skips it and boots vanilla.
+      function parseMomwCfg(t){
+        var c = { content:[], groundcover:[], fbarch:[], fallback:[] };
+        t.split('\n').forEach(function(l){
+          l = l.trim();
+          if (!l || l.charAt(0) === '#') return;
+          if (l.indexOf('content=') === 0) c.content.push(l.slice(8).trim());
+          else if (l.indexOf('groundcover=') === 0) c.groundcover.push(l.slice(12).trim());
+          else if (l.indexOf('fallback-archive=') === 0) c.fbarch.push(l.slice(17).trim());
+          // Movies_ stays under each path's haveVideo logic — a curated cfg must not force
+          // movie fallbacks onto a data set whose .bik files were never staged.
+          else if (l.indexOf('fallback=') === 0 && l.indexOf('fallback=Movies_') !== 0) c.fallback.push(l);
+        });
+        return c;
+      }
+      // Emit the curated lines into a cfg-lines array, checking every entry against the
+      // lowercased top-level file map (a content=/fallback-archive= line naming a file the
+      // VFS doesn't have is a HARD startup failure, so absent entries are reported + skipped).
+      function pushMomwCfg(cfg, mc, rootFiles){
+        var have = function(n){ return rootFiles.has(String(n).toLowerCase()); };
+        var missing = [];
+        mc.fbarch.forEach(function(a){ if (have(a)) cfg.push('fallback-archive='+a); else missing.push(a); });
+        mc.fallback.forEach(function(l){ cfg.push(l); });
+        mc.groundcover.forEach(function(g){ if (have(g)) cfg.push('groundcover='+g); else missing.push(g); });
+        mc.content.forEach(function(k){ if (have(k)) cfg.push('content='+k); else missing.push(k); });
+        if (missing.length)
+          append('[momw] '+missing.length+' curated entr'+(missing.length===1?'y':'ies')
+                 +' not in the data set, skipped: '+missing.join(', '), 'err');
+      }
+      // Optional curated settings defaults (openmw-web-settings.cfg): merged key-by-key into
+      // the baseline /settings.cfg defaults layer (NOT appended — the settings parser rejects
+      // duplicate keys within one file). User-persisted settings still override these.
+      function mergeMomwSettings(t){
+        function parseIni(txt){
+          var cur = '', out = {}, order = [];
+          txt.split('\n').forEach(function(l){
+            var s = l.trim();
+            if (!s || s.charAt(0) === '#') return;
+            var m = /^\[(.+)\]$/.exec(s);
+            if (m){ cur = m[1]; if (!out[cur]){ out[cur] = {}; order.push(cur); } return; }
+            var i = s.indexOf('=');
+            if (i < 0) return;
+            if (!out[cur]){ out[cur] = {}; order.push(cur); }
+            out[cur][s.slice(0, i).trim()] = s.slice(i + 1).trim();
+          });
+          return { map: out, order: order };
+        }
+        try {
+          var base = parseIni(FS.readFile('/settings.cfg', {encoding:'utf8'})), add = parseIni(t);
+          add.order.forEach(function(sec){
+            if (!base.map[sec]){ base.map[sec] = {}; base.order.push(sec); }
+            Object.keys(add.map[sec]).forEach(function(k){ base.map[sec][k] = add.map[sec][k]; });
+          });
+          var lines = [];
+          base.order.forEach(function(sec){
+            lines.push('['+sec+']');
+            Object.keys(base.map[sec]).forEach(function(k){ lines.push(k+' = '+base.map[sec][k]); });
+          });
+          FS.writeFile('/settings.cfg', lines.join('\n') + '\n');
+          append('[momw] merged curated settings defaults (groundcover/postfx/etc.)');
+        } catch(e){ append('[momw] settings merge failed: '+e, 'err'); }
+      }
 
        // --- Optional performance asset pack (Morrowind Optimization Patch + Project Atlas) --------
        // Shipped as ONE streamed BSA rather than ~3300 loose files: loose files would each need an
@@ -2676,11 +2744,28 @@
              __log('[local] intro video (.bik in Video/) '+(hasVideoBik?'FOUND':'NOT found'));
            } catch(e){ console.log('[local] tree summary failed: '+e); }
 
-           // Build the load order from what's present (shared with the server-hosted mwdata/ path).
-           var lo = buildLoadOrder(rootFiles);
-           var content = lo.content, fbarch = lo.fbarch;
+          // Curated load order support for a picked folder too: someone who keeps the SAME
+          // flattened mod-list data set on disk (openmw-web.cfg at its root) gets the precise
+          // curated order while every byte reads locally — nothing streams over the network.
+          // The mounted StreamFS nodes read synchronously from disk, so FS.readFile works here.
+          var momwLocal = null;
+          if (rootFiles.has('openmw-web.cfg') && !/[?&]nomods=1\b/.test(location.search)){
+            try {
+              momwLocal = parseMomwCfg(FS.readFile('/mwdata/'+rootFiles.get('openmw-web.cfg'), {encoding:'utf8'}));
+              append('[momw] curated load order from your folder: '+momwLocal.content.length+' content, '
+                     +momwLocal.groundcover.length+' groundcover, '+momwLocal.fbarch.length+' archives');
+            } catch(e){ append('[momw] could not read openmw-web.cfg from the folder: '+e, 'err'); }
+            if (momwLocal && rootFiles.has('openmw-web-settings.cfg')){
+              try { mergeMomwSettings(FS.readFile('/mwdata/'+rootFiles.get('openmw-web-settings.cfg'), {encoding:'utf8'})); }
+              catch(e){ append('[momw] settings merge failed: '+e, 'err'); }
+            }
+          }
 
-           var wantMovies = hasVideoBik && !/[?&]novid\b/.test(location.search);
+          // Build the load order from what's present (shared with the server-hosted mwdata/ path).
+          var lo = buildLoadOrder(rootFiles);
+          var content = lo.content, fbarch = lo.fbarch;
+
+          var wantMovies = hasVideoBik && !/[?&]novid\b/.test(location.search);
 
            // Folder-backed saves: wait for IDBFS to finish loading (so its reconcile can't wipe the
            // saves we load in), then wire this folder's openmw-web-saves <-> the engine. The game data
@@ -2689,32 +2774,41 @@
            try { await window.__idbfsReady; await setupFolderSaves(dir); }
            catch(e){ append('[saves] folder-save setup skipped: '+(e&&e.message||e),'err'); }
 
-           var assetPack = await mountAssetPack();
+          // The curated data set already contains its own performance meshes resolved in-order
+          // (e.g. Morrowind Optimization Patch + Project Atlas), so the generic asset pack
+          // would re-override them from the highest-priority BSA slot. Skip it in that case.
+          var assetPack = momwLocal ? null : await mountAssetPack();
 
-           (function waitCfg(){
-             if (FS.analyzePath('/openmw.cfg').exists){
-               var cfg = FS.readFile('/openmw.cfg', {encoding:'utf8'}).split('\n').filter(function(l){
-                 return !/^content=/.test(l) && !/^data=\/gamedata\s*$/.test(l) && !/^fallback-archive=/.test(l)
-                     && !/^fallback=Movies_/.test(l);
-               });
-               cfg.push('data=/mwdata', 'config="/userdata/config/openmw"');
-               // data=/mods must exist for fallback-archive= to resolve: it takes a BARE FILENAME and
-               // is looked up by scanning the data= dirs (components/files/collections.cpp).
-               if (assetPack) cfg.push('data=/mods');
-               fbarch.forEach(function(a){ cfg.push('fallback-archive='+a); });
-               // LAST among archives => highest BSA priority => overrides vanilla meshes.
-               if (assetPack) cfg.push('fallback-archive='+assetPack);
-               content.forEach(function(c){ cfg.push('content='+c); });
-               if (window.__omwMPEnabled) cfg.push('content=mp.omwscripts'); // ?mp= (M0 multiplayer)
-               if (wantMovies)
-                 cfg.push('fallback=Movies_Company_Logo,bethesda logo.bik',
-                          'fallback=Movies_Morrowind_Logo,mw_logo.bik',
-                          'fallback=Movies_New_Game,mw_intro.bik');
-               FS.writeFile('/openmw.cfg', cfg.join('\n'));
-               append('[local] READY -> '+content.join(' + ')+' (your files)');
-               removeRunDependency('mw-local');
-             } else { setTimeout(waitCfg, 25); }
-           })();
+          (function waitCfg(){
+            if (FS.analyzePath('/openmw.cfg').exists){
+              var cfg = FS.readFile('/openmw.cfg', {encoding:'utf8'}).split('\n').filter(function(l){
+                return !/^content=/.test(l) && !/^data=\/gamedata\s*$/.test(l) && !/^fallback-archive=/.test(l)
+                    && !/^fallback=Movies_/.test(l);
+              });
+              cfg.push('data=/mwdata', 'config="/userdata/config/openmw"');
+              if (momwLocal){
+                pushMomwCfg(cfg, momwLocal, rootFiles);
+              } else {
+                // data=/mods must exist for fallback-archive= to resolve: it takes a BARE FILENAME and
+                // is looked up by scanning the data= dirs (components/files/collections.cpp).
+                if (assetPack) cfg.push('data=/mods');
+                fbarch.forEach(function(a){ cfg.push('fallback-archive='+a); });
+                // LAST among archives => highest BSA priority => overrides vanilla meshes.
+                if (assetPack) cfg.push('fallback-archive='+assetPack);
+                content.forEach(function(c){ cfg.push('content='+c); });
+              }
+              if (window.__omwMPEnabled) cfg.push('content=mp.omwscripts'); // ?mp= (M0 multiplayer)
+              if (wantMovies)
+                cfg.push('fallback=Movies_Company_Logo,bethesda logo.bik',
+                         'fallback=Movies_Morrowind_Logo,mw_logo.bik',
+                         'fallback=Movies_New_Game,mw_intro.bik');
+              FS.writeFile('/openmw.cfg', cfg.join('\n'));
+              append(momwLocal
+                ? '[local] READY -> curated mod list ('+momwLocal.content.length+' content files, momw order, your files)'
+                : '[local] READY -> '+content.join(' + ')+' (your files)');
+              removeRunDependency('mw-local');
+            } else { setTimeout(waitCfg, 25); }
+          })();
          })().catch(function(e){ bounce('Unexpected error: '+(e&&e.message||e)); });
        }
 
@@ -2874,72 +2968,22 @@
           if (!haveVideo) append('[mw] no Video/*.bik found — intro movies disabled');
           window.__noMovies = !haveVideo || /[?&]novid\b/.test(location.search);
         })
-        // --- Server-curated load order (mwdata/openmw-web.cfg) -------------------------------
-        // A host that stages a REAL mod list (e.g. a flattened modding-openmw.com pack) needs a
-        // precise content order, groundcover= entries and fallback overrides — none of which
-        // buildLoadOrder's alphabetical scan can express (and grass plugins loaded as content=
-        // render as solid clutter). If the operator drops an openmw-web.cfg into mwdata/, its
-        // content=/groundcover=/fallback-archive=/fallback= lines are used VERBATIM instead.
-        // data= lines are ignored: the staged tree is already flattened into the one mwdata dir.
-        // ?nomods=1 still boots vanilla (the file is simply not consulted).
+        // --- Server-curated load order (mwdata/openmw-web.cfg): see parseMomwCfg. ------------
         .then(function(){
           if (!window.__mwRootFiles.has('openmw-web.cfg') || /[?&]nomods=1\b/.test(location.search)) return;
           return fetch('mwdata/openmw-web.cfg')
             .then(function(r){ if (!r.ok) throw new Error('openmw-web.cfg HTTP '+r.status); return r.text(); })
             .then(function(t){
-              var c = { content:[], groundcover:[], fbarch:[], fallback:[] };
-              t.split('\n').forEach(function(l){
-                l = l.trim();
-                if (!l || l.charAt(0) === '#') return;
-                if (l.indexOf('content=') === 0) c.content.push(l.slice(8).trim());
-                else if (l.indexOf('groundcover=') === 0) c.groundcover.push(l.slice(12).trim());
-                else if (l.indexOf('fallback-archive=') === 0) c.fbarch.push(l.slice(17).trim());
-                // Movies_ stays under the haveVideo logic below — a curated cfg must not force
-                // movie fallbacks onto a dataset whose .bik files were never staged.
-                else if (l.indexOf('fallback=') === 0 && l.indexOf('fallback=Movies_') !== 0) c.fallback.push(l);
-              });
-              window.__momwCfg = c;
+              var c = window.__momwCfg = parseMomwCfg(t);
               append('[momw] curated load order: '+c.content.length+' content, '+c.groundcover.length
                      +' groundcover, '+c.fbarch.length+' archives, '+c.fallback.length+' fallback values');
             });
         })
-        // Optional server-curated settings defaults (mwdata/openmw-web-settings.cfg): merged
-        // key-by-key into the baseline /settings.cfg defaults layer (NOT appended — the settings
-        // parser rejects duplicate keys within one file). User-persisted settings still win.
         .then(function(){
           if (!window.__mwRootFiles.has('openmw-web-settings.cfg')) return;
           return fetch('mwdata/openmw-web-settings.cfg')
             .then(function(r){ if (!r.ok) throw new Error('openmw-web-settings.cfg HTTP '+r.status); return r.text(); })
-            .then(function(t){
-              function parseIni(txt){
-                var cur = '', out = {}, order = [];
-                txt.split('\n').forEach(function(l){
-                  var s = l.trim();
-                  if (!s || s.charAt(0) === '#') return;
-                  var m = /^\[(.+)\]$/.exec(s);
-                  if (m){ cur = m[1]; if (!out[cur]){ out[cur] = {}; order.push(cur); } return; }
-                  var i = s.indexOf('=');
-                  if (i < 0) return;
-                  if (!out[cur]){ out[cur] = {}; order.push(cur); }
-                  out[cur][s.slice(0, i).trim()] = s.slice(i + 1).trim();
-                });
-                return { map: out, order: order };
-              }
-              try {
-                var base = parseIni(FS.readFile('/settings.cfg', {encoding:'utf8'})), add = parseIni(t);
-                add.order.forEach(function(sec){
-                  if (!base.map[sec]){ base.map[sec] = {}; base.order.push(sec); }
-                  Object.keys(add.map[sec]).forEach(function(k){ base.map[sec][k] = add.map[sec][k]; });
-                });
-                var lines = [];
-                base.order.forEach(function(sec){
-                  lines.push('['+sec+']');
-                  Object.keys(base.map[sec]).forEach(function(k){ lines.push(k+' = '+base.map[sec][k]); });
-                });
-                FS.writeFile('/settings.cfg', lines.join('\n') + '\n');
-                append('[momw] merged server settings defaults (groundcover/postfx/etc.)');
-              } catch(e){ append('[momw] settings merge failed: '+e, 'err'); }
-            });
+            .then(mergeMomwSettings);
         })
         // The curated dataset already contains its own performance meshes resolved in-order
         // (e.g. Morrowind Optimization Patch + Project Atlas + their patches), so the generic
@@ -2970,15 +3014,7 @@
               // and reported-then-skipped when absent, rather than killing the boot.
               var mc = window.__momwCfg;
               if (mc){
-                var have = function(n){ return window.__mwRootFiles.has(String(n).toLowerCase()); };
-                var missing = [];
-                mc.fbarch.forEach(function(a){ if (have(a)) cfg.push('fallback-archive='+a); else missing.push(a); });
-                mc.fallback.forEach(function(l){ cfg.push(l); });
-                mc.groundcover.forEach(function(g){ if (have(g)) cfg.push('groundcover='+g); else missing.push(g); });
-                mc.content.forEach(function(k){ if (have(k)) cfg.push('content='+k); else missing.push(k); });
-                if (missing.length)
-                  append('[momw] '+missing.length+' curated entr'+(missing.length===1?'y':'ies')
-                         +' not in mwdata, skipped: '+missing.join(', '), 'err');
+                pushMomwCfg(cfg, mc, window.__mwRootFiles);
               } else {
                 var lo = buildLoadOrder(window.__mwRootFiles);
                 lo.fbarch.forEach(function(a){ cfg.push('fallback-archive='+a); });
