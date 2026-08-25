@@ -23,13 +23,16 @@ packs) from a host directory.
    and `.esp` alphabetically — which is correct for Tamriel Rebuilt
    (`Tamriel_Data.esm` sorts before `TR_Mainland.esm`). `?nomods=1` boots vanilla.
 
-2. **Create the Dokploy service**: Compose type, Git provider → this repo,
-   branch `dokploy`, compose path `dokploy/docker-compose.yml`.
+2. **Create the Dokploy service**: Compose type, Git provider → this repo
+   (public), branch `dokploy`, compose path `dokploy/docker-compose.yml`.
 
-3. **Attach a domain** to service `morrowind`, container port `8910`, HTTPS on
-   (Let's Encrypt). HTTPS is not optional: the engine is multi-threaded WASM and
-   needs cross-origin isolation, which browsers only grant on secure origins.
-   The isolation headers themselves (COOP/COEP/CORP) are sent by `server.py`.
+3. **Routing is baked into the compose** as Traefik labels for
+   `morrowind.saisoft.works` (edit the `Host(...)` label to change it), joined to
+   the external `dokploy-network`. Point a DNS A record for that host at the
+   server and Let's Encrypt issues the certificate on first request. HTTPS is not
+   optional: the engine is multi-threaded WASM and needs cross-origin isolation,
+   which browsers only grant on secure origins. The isolation headers themselves
+   (COOP/COEP/CORP) are sent by `server.py`.
 
 4. Deploy. Open the domain in **desktop Chrome/Chromium** and pick
    "This server's copy".
