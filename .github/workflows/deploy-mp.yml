@@ -15,7 +15,11 @@ on:
     branches: [ovhcloud]
     paths:
       - 'server/**'
-      - 'deploy/openmw-mp.caddy'
+      # The sim peer is COMPILED from openmw/ into this image (Dockerfile.simpeer), so an
+      # engine change that does not rebuild here leaves the peer simulating with a different
+      # engine than the clients are running.
+      - 'openmw/**'
+      - 'deploy/upload.virtastic.app.caddy'
       - '.github/workflows/deploy-mp.yml'
   workflow_dispatch:
 
@@ -30,8 +34,7 @@ jobs:
     if: github.repository == 'Virtastic/openmw-web' && github.event_name != 'pull_request'
     runs-on: [self-hosted, ovh, virtastic]
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Hard gate: the test stage runs typecheck + the full unit/integration suite inside the
       # build. A red suite never reaches the box. --network=host: npm ci needs egress, which
       # the default build bridge lacks here (same reason as deploy-ovh.yml).
@@ -39,7 +42,21 @@ jobs:
         run: DOCKER_BUILDKIT=1 docker build --network=host --target test -f server/Dockerfile server/
 
       - name: Build image
-        run: DOCKER_BUILDKIT=1 docker build --network=host -t openmw-mp:ovh -f server/Dockerfile server/
+        run: |
+          # Dockerfile.simpeer --target tier2, from the REPO ROOT. NOT server/Dockerfile:
+          # ci/jenkins/build-server.sh says it outright - "that alpine/musl image has no peer
+          # binary and cannot run the glibc one". This workflow built it anyway, so the first
+          # production multiplayer deploy came up and died with "no sim-peer binary". It was
+          # never caught because production had never deployed multiplayer before.
+          # The context is the repo root because the image compiles the OpenMW fork, so it
+          # needs openmw/ in the context.
+          DOCKER_BUILDKIT=1 docker build --network=host \
+            -f server/Dockerfile.simpeer --target tier2 -t openmw-mp:ovh .
+          # Assert the peer is actually in there, like the Jenkins build does. Without it the
+          # server starts, finds no binary and exits, which is a crash loop rather than a
+          # degraded mode - so failing here is strictly better than failing on the box.
+          docker run --rm --entrypoint sh openmw-mp:ovh -c 'command -v openmw' \
+            || { echo "FATAL: openmw-mp:ovh has no openmw peer binary" >&2; exit 1; }
 
       - name: Sync compose to /opt/openmw-mp
         run: |
@@ -68,6 +85,12 @@ jobs:
       - name: Start / update container
         run: docker compose -f /opt/openmw-mp/docker-compose.prod.yml up -d
 
+      # The file-mode upload host (see the vhost's own header for why it exists). Its cert
+      # and DNS record are one-time box setup (docs/PRODUCTION-BRINGUP.md §6); the vhost
+      # itself is pipeline-owned like morrowind.caddy.
+      - name: Install upload-host edge vhost
+        run: sudo cp deploy/upload.virtastic.app.caddy /opt/edge/sites/upload.virtastic.app.caddy
+
       # Validate, then restart the shared edge to apply (admin API disabled -> no `caddy
       # reload`; restart re-reads the Caddyfile, ~3s blip). Validate first to protect the
       # co-tenant sites.
@@ -83,14 +106,36 @@ jobs:
           docker run --rm --network nostalgia curlimages/curl:latest \
             -fsS http://openmw-mp:8080/healthz | grep -q ok
 
-      # Gate 2 — protocol-level: a real omw-mp/1 hello through the container's WS endpoint.
+      # Gate 1b — storage is what the config asked for. A configured [locker] endpoint with
+      # no S3 keys used to fall back to filesystem storage with one info line: uploads then
+      # rode the site origin through Cloudflare, whose free-plan 100 MB body cap killed every
+      # BSA/media upload at the edge — invisible in server logs, and shipped that way for a
+      # month. The server now logs locker.s3_creds_missing at error level; a deploy that
+      # boots into that state is broken and must not go green. (compose up -d recreated the
+      # container above, so these logs are this boot's, not history.)
+      - name: Health check (locker storage mode)
+        run: |
+          if docker logs openmw-mp 2>&1 | grep -q 'locker.s3_creds_missing'; then
+            echo "FATAL: [locker] endpoint is configured but S3 credentials are missing" >&2
+            echo "       (stage them in /opt/openmw-mp/data/s3.env — docs/PRODUCTION-BRINGUP.md §3)" >&2
+            exit 1
+          fi
+
+      # Gate 2 — protocol-level: a real omw-mp/1 hello along the path a client takes. The bot
+      # asks the directory (GET /worlds) for a wsPath and dials /w/<worldId> through the
+      # gateway's upgrade splice. NOT ws://…/ws: the gateway has no /ws route and answers 502
+      # by design (deploy/Caddyfile), so that probe failed every deploy while the service was
+      # fine. --allow-refusal=BAD_CONTENT: a tier-2 world pins the sim peer's content list, so
+      # the data-less bot is always refused BAD_CONTENT — after the handshake, splice and
+      # hello all worked, which is exactly what this gate exists to prove.
       # Zero-dep bot (Node's global WebSocket) run inside the freshly built image, so it needs
       # no node on the runner and no extra deps.
       - name: Health check (protocol)
         run: |
           docker run --rm --network nostalgia \
             -v "$PWD/server/bots:/bots:ro" \
-            openmw-mp:ovh node /bots/healthcheck.mjs ws://openmw-mp:8080/ws
+            openmw-mp:ovh node /bots/healthcheck.mjs http://openmw-mp:8080 \
+              --allow-refusal=BAD_CONTENT
 
       # Gate 3 - the edge path a PLAYER actually takes. The game page and the gateway are one
       # origin (AGENTS.md, "One origin"): index.html refuses to hand its session ticket to a
@@ -113,13 +158,20 @@ jobs:
           # Proves the gateway is reachable THROUGH the game's own Caddy, which is the only way
           # a browser reaches it. /healthz and /status are deliberately not exposed here.
           E -f https://morrowind.virtastic.app/auth/providers | tee /dev/stderr | grep -q '"providers"'
-          # The gameplay socket, on the origin the client dials. The upgrade MUST carry the
-          # omw-mp.1 subprotocol or the server rejects the handshake.
-          code=$(E -o /dev/null -w '%{http_code}' --http1.1 \
+          # The gameplay socket, on the origin the client dials. Two traps this has already
+          # fallen into:
+          #  - Sec-WebSocket-Key MUST be base64 of exactly 16 bytes (RFC 6455). The old key
+          #    decoded to 13, and the world's ws library rejects that with HTTP 400 before
+          #    the handshake — so this gate read "edge broken" with everything healthy.
+          #    dGhlIHNhbXBsZSBub25jZQ== is the RFC's own sample key (AGENTS.md uses it too).
+          #  - After a 101 curl just streams the socket forever (the server only hangs up at
+          #    its hello timeout), so cap it with --max-time; on timeout curl exits 28 but
+          #    has already written the -w %{http_code}, which is all we want.
+          code=$(E -o /dev/null -w '%{http_code}' --http1.1 --max-time 8 \
             -H "Connection: Upgrade" -H "Upgrade: websocket" \
-            -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: aGVhbHRoY2hlY2sxNg==" \
+            -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
             -H "Sec-WebSocket-Protocol: omw-mp.1" \
-            https://morrowind.virtastic.app/w/vvardenfell)
+            https://morrowind.virtastic.app/w/vvardenfell || true)
           test "$code" = 101 || { echo "FATAL: WS upgrade at the edge returned HTTP $code (want 101)" >&2; exit 1; }
           echo "edge health OK (101 upgrade on /w/ + providers)"
 

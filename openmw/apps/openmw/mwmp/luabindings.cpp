@@ -1,6 +1,7 @@
 // Added by Virtastic (https://virtastic.app) for the OpenMW-Web port, 2026.
 // See WASM_ADAPTATIONS.md at the repository root for details.
 #include "luabindings.hpp"
+#include "puppets.hpp"
 
 #include <cstdlib>
 #include <vector>
@@ -13,7 +14,11 @@
 #include <emscripten.h>
 #endif
 
+#include <components/debug/debuglog.hpp>
 #include <components/esm/refid.hpp>
+#include <components/esm3/loadbsgn.hpp>
+#include <components/esm3/loadclas.hpp>
+#include <components/esm3/loadrace.hpp>
 #include <components/lua/luastate.hpp>
 #include <components/lua/serialization.hpp>
 
@@ -29,6 +34,12 @@
 #include "../mwlua/object.hpp"
 
 #include "../mwinput/actions.hpp"
+
+#include "../mwmechanics/activespells.hpp"
+#include "../mwmechanics/creaturestats.hpp"
+
+#include "../mwworld/class.hpp"
+#include "../mwworld/esmstore.hpp"
 
 #include "netmanager.hpp"
 
@@ -143,6 +154,37 @@ namespace MWMP
                 [id, count] { MWBase::Environment::get().getMechanicsManager()->setDeaths(id, count); },
                 "MPSetDeadCount");
         };
+        // PUPPET REGISTRY (see puppets.hpp). Lua knows which actors a remote peer simulates;
+        // the C++ magic-damage site needs that answer synchronously, because it applies damage
+        // itself and there is no Lua veto on that path the way there is for melee.
+        api["setPuppet"] = [](const sol::object& obj, bool on) {
+            if (!obj.is<MWLua::Object>())
+                return;
+            setPuppet(obj.as<MWLua::Object>().id(), on);
+        };
+        api["clearPuppets"] = []() { clearPuppets(); };
+        // Drain the harmful magic effects the engine declined to apply to THIS actor, so its
+        // puppet script can forward them to whoever owns it. Per-object on purpose: the puppet
+        // local script already has the object and already forwards melee the same way
+        // (core.sendGlobalEvent 'mpCombatHit'), so this needs no RefNum-to-object lookup in Lua.
+        // Returns an array of {effectId=string, magnitude=number, stat=0|1|2}
+        // (0 health, 1 magicka, 2 fatigue).
+        api["takeMagicHits"] = [](sol::this_state state, const sol::object& obj) {
+            sol::table out(state, sol::create);
+            if (!obj.is<MWLua::Object>())
+                return out;
+            int i = 1;
+            for (const MagicHit& h : takeMagicHitsFor(obj.as<MWLua::Object>().id()))
+            {
+                sol::table e(state, sol::create);
+                e["effectId"] = h.mEffectId;
+                e["spellId"] = h.mSpellId;
+                e["magnitude"] = h.mMagnitude;
+                e["stat"] = h.mStat;
+                out[i++] = e;
+            }
+            return out;
+        };
         api["isEnabled"] = []() { return std::getenv("OPENMW_MP_URL") != nullptr; };
         api["getUrl"] = []() { return getEnvString("OPENMW_MP_URL"); };
         api["getName"] = []() { return getEnvString("OPENMW_MP_NAME"); };
@@ -206,13 +248,43 @@ namespace MWMP
                     // chargen makes puts the name on it.
                     if (!name.empty())
                         mechanics->setPlayerName(name);
-                    if (!race.empty())
+                    // RESOLVE BEFORE APPLYING. Every one of these ends in buildPlayer(), which
+                    // looks the id up with Store::find() -- and find() THROWS when search()
+                    // returns null. An id that does not resolve therefore does not degrade, it
+                    // aborts this whole action, so everything sequenced AFTER the bad field
+                    // (class, birthsign, name) silently never applies.
+                    //
+                    // This is reachable, not theoretical. snapAppearance fills an empty field
+                    // from NPC.records['villager_00'] and falls back to the literal string
+                    // "none" when that record is missing -- and villager_00 is a DEMO record
+                    // present in NO retail data file (checked: absent from Morrowind.esm,
+                    // Tribunal.esm and Bloodmoon.esm), and carries no class even where it does
+                    // exist. "none" is not a missing value; it is an invalid record id.
+                    //
+                    // The fix belongs HERE and not in snapAppearance: the server REJECTS an
+                    // appearance with any empty race/head/class/name (playerstate.ts
+                    // handleAppearance), and a rejected appearance leaves doc.appearance unset,
+                    // which withholds playerRecord on every join and loses the character's
+                    // inventory and position. Sending "" instead of "none" would trade a
+                    // recoverable cosmetic default for exactly that. So the placeholder stays,
+                    // and the CONSUMER declines to apply what it cannot resolve.
+                    const MWWorld::ESMStore& store = *MWBase::Environment::get().getESMStore();
+                    const auto resolves = [&](const auto& recordStore, const std::string& id) {
+                        return !id.empty() && recordStore.search(ESM::RefId::deserializeText(id)) != nullptr;
+                    };
+                    if (resolves(store.get<ESM::Race>(), race))
                         mechanics->setPlayerRace(ESM::RefId::deserializeText(race), isMale,
                             ESM::RefId::deserializeText(head), ESM::RefId::deserializeText(hair));
-                    if (!cls.empty())
+                    else if (!race.empty())
+                        Log(Debug::Warning) << "[mp] chargen: unknown race '" << race << "', left as-is";
+                    if (resolves(store.get<ESM::Class>(), cls))
                         mechanics->setPlayerClass(ESM::RefId::deserializeText(cls));
-                    if (!birthsign.empty())
+                    else if (!cls.empty())
+                        Log(Debug::Warning) << "[mp] chargen: unknown class '" << cls << "', left as-is";
+                    if (resolves(store.get<ESM::BirthSign>(), birthsign))
                         mechanics->setPlayerBirthsign(ESM::RefId::deserializeText(birthsign));
+                    else if (!birthsign.empty())
+                        Log(Debug::Warning) << "[mp] chargen: unknown birthsign '" << birthsign << "'";
                 },
                 "MPApplyChargen");
         };
@@ -228,6 +300,33 @@ namespace MWMP
                 },
                 "MPResurrect");
         };
+        // Purge every active effect on the player. The rejoin restore REBUILDS a character in
+        // place: applyChargen runs buildPlayer(), which grants this character its race and
+        // birthsign abilities, and phase 2 then writes the saved spell set over the top.
+        //
+        // Nothing in that sequence takes the OLD effects off. Spells::clear() and removeSpell()
+        // touch the spell LIST only -- neither purges what those spells already applied -- and
+        // the Lua activeSpells:remove() refuses anything without Flag_Temporary, so a constant-
+        // effect ability cannot be removed from script at all. So each rebuild layered another
+        // copy of the birthsign ability on top of the last: a Lady's Favor character (Fortify
+        // Endurance 25 + Fortify Personality 25) was seen at +175 on both and then +225 a few
+        // minutes later -- 7 copies, then 9. The character sheet shows getModified(), and base
+        // fatigue is recomputed from the MODIFIED attributes, which is why the fatigue bar
+        // tracked the inflation exactly instead of contradicting it.
+        //
+        // This is the same primitive buildPlayer() already uses on the line below its spell
+        // clear, exposed so the restore can reset to a clean slate before re-adding. The
+        // engine re-applies each ability on the next update, guarded by isSpellActive, so the
+        // count after a restore is exactly one and cannot climb.
+        api["clearActiveSpells"] = [luaManager = context.mLuaManager]() {
+            luaManager->addAction(
+                [] {
+                    MWWorld::Ptr player = MWBase::Environment::get().getWorld()->getPlayerPtr();
+                    player.getClass().getCreatureStats(player).getActiveSpells().clear(player);
+                },
+                "MPClearActiveSpells");
+        };
+
         // M7 WorldMapExplored (PROTOCOL.md §M7): mark an exterior cell as discovered on the
         // world map. There is no Lua binding for map state in 0.52, and the only reachable
         // surface is GUI-side: WindowManager::addVisitedLocation (mwbase/windowmanager.hpp:243)

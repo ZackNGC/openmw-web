@@ -50,12 +50,28 @@ local function worldUrlOf(w)
 end
 
 local function chargenTick()
+    -- RE-REPORT ON EVERY CONNECTION, not once per process. identity.reset() shuts the baseline
+    -- gate whenever we are not Joined, and for a brand new character MP_ChargenDone is the only
+    -- thing that reopens it -- so a character that finished creation and then merely RECONNECTED
+    -- (same process, so no page reload) would find the gate shut and nothing to reopen it, and
+    -- would silently stop persisting anything. The send is idempotent by design, which is what
+    -- makes re-reporting the safe direction.
+    if net.state ~= 'Joined' then chargenReported = false end
     if chargenDone and chargenReported then return end
     if not chargenDone then
         local ok, v = pcall(function() return world.mwscript.getGlobalVariables()['chargenstate'] end)
         if ok and v == -1 then
             chargenDone = true
             mp.testSet('chargenDone', '1')
+            -- Tell the PLAYER script too, not just the server. identity.lua holds the persistent
+            -- halves of the sync (attributes, skills, level, spellbook, inventory) and keeps them
+            -- silent until it knows what this character is -- otherwise it broadcasts the raw
+            -- template the engine starts with (every attribute 30, every skill 5, hand-to-hand
+            -- 100) and the server stores that over the real character, permanently. A returning
+            -- character opens that gate when its record finishes applying; a BRAND NEW one has no
+            -- record to apply, and this is the only other moment it stops being a template.
+            local p = world.players[1]
+            if p then p:sendEvent('MP_ChargenDone', {}) end
         end
     end
     -- Tell the server creation FINISHED for this slot: until this lands the character is
@@ -164,6 +180,12 @@ local function tryTeleport(obj, cellArg, pos)
     local ok = pcall(function() obj:teleport(cellArg, pos) end)
     return ok
 end
+
+-- Throttle for MP_CombatRefused: one explanation per situation, not one per swing.
+-- Which cell the sim peer is currently standing in, so it only relocates when that changes.
+local peerStandingIn = nil
+local combatRefusedAt = nil
+local COMBAT_REFUSED_EVERY = 8 -- seconds
 
 local function toPlayer(eventName, data)
     local player = playerScript()
@@ -506,6 +528,7 @@ local testItemRecordId = nil -- dynamic record for the equiptest harness hook
 local chestRecordId = nil
 local chestObj = nil
 local lastChestOpId = nil
+local testCastSpellId = nil -- created once by mpTestCastAt
 local lastDoorMirror = 0
 
 local function nearestDoor()
@@ -638,6 +661,37 @@ local function restoreTick()
             end
         end
     end
+    -- PER-ITEM STATE, applied after the grant and strictly best-effort. Without this every
+    -- rejoin handed the character fully repaired gear, fully charged enchantments and empty
+    -- soul gems, because createObject builds a FRESH object and the doc only ever recorded a
+    -- record id and a count. Each failure in here is swallowed on purpose: the item itself is
+    -- already correctly in the inventory, and losing its wear is a far smaller harm than
+    -- aborting the rest of the restore over it.
+    local restored = 0
+    for recId, bucket in pairs(record.itemStates or {}) do
+        local localId = worldmp.toLocal(recId)
+        local idx = 0
+        local okAll = pcall(function()
+            for _, item in ipairs(inventory:getAll()) do
+                if item.recordId == localId then
+                    idx = idx + 1
+                    local st = bucket[idx]
+                    if st then
+                        local d = item.itemData
+                        if st.condition ~= nil then pcall(function() d.condition = st.condition end) end
+                        if st.charge ~= nil then pcall(function() d.enchantmentCharge = st.charge end) end
+                        if st.soul ~= nil then pcall(function() d.soul = st.soul end) end
+                        restored = restored + 1
+                    end
+                end
+            end
+        end)
+        if not okAll then
+            print('[mp] restore: item state for "' .. tostring(recId) .. '" did not apply')
+        end
+    end
+    if restored > 0 then print('[mp] restored state on ' .. tostring(restored) .. ' item(s)') end
+
     mp.testSet('restorePos', record.position and json.encode(record.position) or 'none')
     if record.position then
         teleportPlayerTo(record.position)
@@ -693,6 +747,9 @@ local function puppetTick()
 end
 
 local function start()
+    -- net.lua cannot reach the player script, so it announces through this. Set before
+    -- anything can drop, or the very first outage would be the silent one.
+    net.noticeFn = notice
     if not mp.isEnabled() then return end
     if mp.vectorsEnabled() then dumpVectors() end
     -- M3 world-object hub wiring (see scripts/mp/objects.lua).
@@ -701,6 +758,11 @@ local function start()
         ownCellKeyFn = function() return ownCellKeyCache end,
         ownIdFn = function() return net.state == 'Joined' and net.playerId or nil end,
         placeholderItemFn = placeholderItemId,
+        -- A refused container op UNDOES the optimistic local take, so without this the item
+        -- simply disappears out of the player's inventory a moment after they picked it up.
+        -- notice() is queued and flushed against the player script, so it is a no-op on the
+        -- headless sim peer rather than something that needs guarding at the call site.
+        noticeFn = notice,
     })
     -- M4 shared-NPC authority hub (see scripts/mp/actors.lua). isMpPuppetFn tells the actor
     -- sampler which active actors are remote-PLAYER puppets (driven by player move frames) so
@@ -909,6 +971,33 @@ local eventHandlers = {
         end
     end,
     MP_WorldCreate = function(data) toPlayer('MP_WorldCreate', data) end,
+    -- BOTH OF THESE WERE SENT BY THE SERVER AND HANDLED BY NOBODY. A server->client event with
+    -- no handler is not an error anywhere: it arrives, matches nothing, and is dropped in
+    -- silence, so the feature reads as unimplemented while the server-side half is complete
+    -- and tested. Found by diffing every `sendEvent` on the server against every `MP_*`
+    -- handler here.
+    --
+    -- WorldTimeRefused: the server refuses a Rest/Wait under `[rules] timeSkip` and says so
+    -- deliberately — m7.ts's own comment is "Refusals are TOLD to the player — a Rest that
+    -- silently does nothing gets pressed again and then reported as a bug". Which is exactly
+    -- what happened, because the telling never arrived. It matters more now than when it was
+    -- written: the public world ships `timeSkip = "off"`, so resting in the lobby is a thing
+    -- every visitor will try.
+    MP_WorldTimeRefused = function(data) toPlayer('MP_WorldTimeRefused', data) end,
+    -- SocialNotice: you were kicked from a party, or the leader left and it disbanded. The
+    -- server sends it precisely so the party does not just evaporate with nobody knowing why.
+    MP_SocialNotice = function(data) toPlayer('MP_SocialNotice', data) end,
+    -- Why that swing did nothing. The attacker's client has ALREADY cancelled its own damage by
+    -- the time the server sees the hit, so a drop costs the whole attack — and the cell being
+    -- unsimulated is not something the player can see. Throttled here rather than on the server
+    -- because the server would have to keep per-player state to do it, and one message per
+    -- situation is what is wanted, not one per swing.
+    MP_CombatRefused = function(data)
+        local now = core.getRealTime()
+        if combatRefusedAt and now - combatRefusedAt < COMBAT_REFUSED_EVERY then return end
+        combatRefusedAt = now
+        toPlayer('MP_CombatRefused', data)
+    end,
     MP_FriendRequestReceived = function(data) toPlayer('MP_FriendRequestReceived', data) end,
     MP_InviteReceived = function(data) toPlayer('MP_InviteReceived', data) end,
     MP_PresenceUpdate = function(data) toPlayer('MP_PresenceUpdate', data) end,
@@ -979,6 +1068,27 @@ local eventHandlers = {
             if type(name) == 'string' and name ~= '' then rooms[#rooms + 1] = name end
         end
         mp.setSimAnchors(out, rooms)
+
+        -- AND GO STAND THERE. Loading a cell is not simulating it. OpenMW hard-clamps
+        -- [Game] actors processing range to 7168 units while an exterior cell is 8192 wide, so
+        -- this engine only ticks actors near its OWN position no matter how much it has loaded.
+        -- Anchors alone therefore produced a peer that held every occupied cell and simulated
+        -- none of them except the one it booted in: the server logged authority.silent_peer, and
+        -- players two cells away watched monsters stand still and melee pass through them.
+        --
+        -- data.place is the position the server already computes to SPAWN the peer -- a real
+        -- player's, so it is valid ground rather than a computed cell centre that might be
+        -- inside terrain. Only move when the cell actually changes: teleporting every 5 s resets
+        -- the actors' AI packages and would keep them permanently re-deciding what to do.
+        local place = data and data.place
+        if place and place.cellKey and place.cellKey ~= peerStandingIn then
+            local cellArg = inviteCellArg(place.cellKey)
+            local p = world.players[1]
+            if cellArg and p and tryTeleport(p, cellArg, util.vector3(place.x or 0, place.y or 0, place.z or 0)) then
+                peerStandingIn = place.cellKey
+                print('[mp] sim peer moved to ' .. tostring(place.cellKey) .. ' to simulate it')
+            end
+        end
     end,
     -- The credential for the next world, minted by the one we are still connected to. The
     -- pending switch is waiting on exactly this.
@@ -1041,11 +1151,21 @@ local eventHandlers = {
     -- knows where the host actually is.
     MP_InviteAccepted = function(data)
         local player = playerScript()
-        if not player or not data.cellKey then return end
+        if not player then return end -- headless peer: nothing to travel
+        -- ACCEPTING AN INVITE AND GOING NOWHERE USED TO BE SILENT. Both of these leave the
+        -- player exactly where they were, having just pressed "accept" — which reads as the
+        -- invite being broken rather than the travel being. One line each is the whole fix.
+        if not data.cellKey then
+            notice('Could not work out where they are — ask them to try again.')
+            return
+        end
         local ok, err = pcall(function()
             player:teleport(inviteCellArg(tostring(data.cellKey)), util.vector3(data.x or 0, data.y or 0, data.z or 0))
         end)
-        if not ok then print('[mp] invite teleport failed: ' .. tostring(err)) end
+        if not ok then
+            print('[mp] invite teleport failed: ' .. tostring(err))
+            notice('Could not travel to them just now.')
+        end
         mp.testSet('invitedTo', tostring(data.cellKey))
     end,
 
@@ -1405,13 +1525,76 @@ local eventHandlers = {
             print('[mp] mpTestHit: no victim for ' .. json.encode(data))
             return
         end
+        -- WHICH DAMAGE CHANNEL. The engine fills EITHER health OR fatigue and never both
+        -- (mwlua/luamanagerimp.cpp onHit), and an UNARMED blow in Morrowind is a fatigue hit.
+        -- This hook used to hardcode health, which is precisely why the suite could not catch
+        -- the server refusing every hand-to-hand swing in the game: no scenario was able to
+        -- express the failing case, so 46 of them passed while combat was completely broken for
+        -- anyone without a weapon. A test hook that cannot produce the shape a real client
+        -- produces is not covering the code, it is covering the half somebody remembered.
+        local n = data.damage or 10
+        local damage = data.channel == 'fatigue' and { fatigue = n } or { health = n }
         victim:sendEvent('Hit', {
-            damage = { health = data.damage or 10 },
+            damage = damage,
             strength = 1,
             successful = true,
             sourceType = 'Melee',
             attacker = playerScript(),
         })
+    end,
+
+    -- M5 test hook: CAST a damaging spell at a cell NPC (castat:<recordId>:<magnitude>).
+    -- The melee hook posts a `Hit` event; this one goes through the MAGIC path
+    -- (mwmechanics/spelleffects.cpp), which is a different code path entirely and the one that
+    -- never propagated before the puppet registry existed. Headless CDP cannot cast a spell, so
+    -- without this there is no automated way to exercise it at all.
+    mpTestCastAt = function(data)
+        local victim = nil
+        for _, obj in ipairs(world.activeActors) do
+            if obj:isValid() and obj.recordId == data.record then victim = obj break end
+        end
+        if not victim then
+            print('[mp] mpTestCastAt: no victim for ' .. tostring(data.record))
+            mp.testSet('castAt', 'no-victim')
+            return
+        end
+        -- A SPELL THE OWNER ALSO HAS. Creating a record here would make a DYNAMIC spell that
+        -- exists only on this client; the owner applies the spell by id
+        -- (combat.lua MP_CombatSpellHit), finds nothing, and silently applies nothing — which
+        -- is exactly how this failed the first time. Pick one out of the shared content
+        -- instead, so both sides can resolve it.
+        if not testCastSpellId then
+            local harmful = { damagehealth = true, firedamage = true, shockdamage = true,
+                              frostdamage = true, poison = true }
+            local okFind = pcall(function()
+                for _, spell in pairs(core.magic.spells.records) do
+                    for _, eff in ipairs(spell.effects or {}) do
+                        local id = eff.effect and eff.effect.id or eff.id
+                        if id and harmful[tostring(id)] then
+                            testCastSpellId = spell.id
+                            return
+                        end
+                    end
+                end
+            end)
+            if not okFind or not testCastSpellId then
+                print('[mp] mpTestCastAt: no harmful spell in this content')
+                mp.testSet('castAt', 'no-harmful-spell')
+                return
+            end
+        end
+        local okAdd, err = pcall(function()
+            types.Actor.activeSpells(victim):add({
+                id = testCastSpellId, effects = { 0 },
+                caster = playerScript(), ignoreResistances = true,
+            })
+        end)
+        if not okAdd then
+            print('[mp] mpTestCastAt failed: ' .. tostring(err))
+            mp.testSet('castAt', 'add-failed:' .. tostring(err))
+        else
+            mp.testSet('castAt', 'cast:' .. tostring(testCastSpellId))
+        end
     end,
 
     -- M4 test hook: kill a specific cell NPC (holder side drives the death edge).
@@ -1569,8 +1752,19 @@ local eventHandlers = {
     end,
 
     mpJoinWorld = function(data)
+        -- `url` is still honoured for any caller that already has one; the Worlds tab now
+        -- sends the world's FIELDS instead and lets worldUrlOf decide, so the gateway-path
+        -- rule lives in exactly one place. Without this the tab's join button computed
+        -- ws://nil:nil/ws, because the directory publishes no host or port.
         local url = tostring(data.url or '')
-        if url == '' then return end
+        if url == '' then url = worldUrlOf(data) or '' end
+        if url == '' then
+            -- Say so. A silent return here is indistinguishable from a click that did nothing,
+            -- and that is how this stayed broken.
+            print('[mp] cannot join ' .. tostring(data.name) .. ': it published no address')
+            notice('That world did not say where to connect.')
+            return
+        end
         print('[mp] switching to ' .. tostring(data.name) .. ' at ' .. url)
         net.switchTo(url)
     end,
@@ -1717,6 +1911,12 @@ local eventHandlers = {
         quests.onQuestUpdate(data.questId, data.stage)
     end,
     -- Dialogue window closed on the player side -> release the lock.
+    -- Barter opened/closed on a merchant. Routed through the global script because the
+    -- container machinery lives there and a local script cannot read another actor's inventory.
+    mpBarterOpen = function(data)
+        if data and data.merchant then objects.onBarterOpen(data.merchant) end
+    end,
+    mpBarterClose = function() objects.onBarterClose() end,
     mpDialogueClosed = function()
         quests.releaseLock('windowclosed')
     end,
@@ -1758,6 +1958,8 @@ for name, fn in pairs(combat.handlers) do
 end
 -- puppet.lua -> here: a hit landed on a puppet; forward it to the victim's owner.
 eventHandlers.mpCombatHit = combat.onPuppetHit
+
+eventHandlers.mpCombatSpellHit = combat.onPuppetSpellHit
 -- Wrap the op-result applier to expose the outcome to the harness (s31 race assert).
 local baseOpResult = eventHandlers.MP_ContainerOpResult
 eventHandlers.MP_ContainerOpResult = function(data)

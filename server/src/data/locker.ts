@@ -47,6 +47,23 @@ const LOCKER_MIGRATIONS = [
       )`);
     },
   },
+  {
+    name: '002-media-pack-status',
+    up: (db: DatabaseSync) => {
+      // WHY A PLAYER-VISIBLE REASON EXISTS. verifyMediaPack runs after recordUploaded has
+      // already answered ok:true, so a rejection lands with nobody listening: the wizard said
+      // "uploaded", the pack is deleted, and the next launch asks for the same 166 MB again
+      // with nothing said about why. That loop is indistinguishable from the upload silently
+      // not working, and it cost a real player two full re-uploads before the server logs
+      // explained it. The verdict is kept here so the client can say what happened.
+      db.exec(`CREATE TABLE locker_media_status (
+        accountKey TEXT PRIMARY KEY,
+        reason     TEXT NOT NULL,   -- verifyMediaPack's fail() reason, or 'ok'
+        detail     TEXT,            -- the offending entry, when there is one
+        at         TEXT NOT NULL
+      )`);
+    },
+  },
 ];
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -78,6 +95,30 @@ export interface LockerFile {
   size: number;
   sha256: string;
 }
+
+/** One row of the upload wizard's checklist. */
+export interface LockerNeed {
+  name: string;
+  size: number;
+  /** The world this server runs loads this file. Never relaxed — see requiredManifest. */
+  required: boolean;
+  /** Loose media, summarised as a folder row (or the packed media.tar). */
+  media?: boolean;
+  /** Required only because a shared world loads it. A cloud SINGLE-PLAYER session has no
+   *  content list to match, so it may be started without this. Absent = needed either way. */
+  soloOptional?: boolean;
+}
+
+// The official expansions, plugin and archive alike. They are one unit: an .esm without its
+// .bsa loads and then renders `marker_error` for everything it owns (see core/gamedata.ts),
+// so offering to skip one without the other would produce a visibly broken game rather than
+// a smaller one.
+//
+// Named here rather than derived from the world's content list because the manifest ALREADY
+// comes from that folder — an operator with a Morrowind-only install has no Tribunal row for
+// this to match. Mods stay required: a plugin the world loads changes the simulation, which
+// is not the same kind of thing as content Bethesda sold separately.
+const EXPANSION = /^(tribunal|bloodmoon)\.(esm|bsa)$/i;
 
 export type UploadRefusal =
   | 'no-attestation'
@@ -261,6 +302,19 @@ export class Locker {
     return this.mediaEntries().reduce((a, f) => a + f.size, 0);
   }
 
+  // The packable media paths, lowercased — the list the wizard filters its pack against.
+  //
+  // WHY THIS IS EXPOSED. verifyMediaPack rejects a pack containing ANY entry this manifest
+  // does not know, and that rejection destroys the WHOLE pack. Two genuine retail installs
+  // legitimately differ in which media is loose and which is inside a BSA (a player whose
+  // copy carries Sound/Cr/alamlexia/ loose lost a 166 MB upload to that difference, then was
+  // asked to upload it again forever). Without the list, a client cannot know what to leave
+  // out; with it, the client packs only recognized files and the strict server-side gate
+  // stays exactly as strict. Names only — hashes stay server-side (see requiredManifest).
+  packableMedia(): string[] {
+    return this.mediaEntries().map((f) => f.name.toLowerCase());
+  }
+
   // The size ceiling for a media pack: the media bytes plus USTAR overhead (a 512-byte
   // header per file + padding) with a little slack for distribution differences.
   private mediaPackCap(): number {
@@ -269,16 +323,29 @@ export class Locker {
   }
 
   // The checklist the upload wizard renders: one entry per distinct game file the operator's
-  // manifest knows, with the base game marked required and the expansions optional (a player
-  // who owns only Morrowind must not be blocked on Tribunal/Bloodmoon). Sizes are the display
-  // hint; hashes are deliberately not exposed here. Loose media collapses to one synthetic
-  // "media.tar" row (voice/music/videos) that the wizard builds from a folder pick.
-  // EVERYTHING the operator's manifest lists is required. The manifest IS this server's
-  // content set: a client missing Tribunal/Bloodmoon (or the media) cannot match the world
-  // the server authors, so "optional" was never a real category here — it just produced
-  // players with silent, half-loaded games. An operator who wants a Morrowind-only server
-  // generates a Morrowind-only manifest.
-  requiredManifest(): { name: string; size: number; required: boolean; media?: boolean }[] {
+  // manifest knows. Sizes are the display hint; hashes are deliberately not exposed here.
+  // Loose media collapses to one synthetic "media.tar" row (voice/music/videos) that the
+  // wizard builds from a folder pick.
+  //
+  // EVERYTHING the operator's manifest lists stays `required: true`, and that is still right
+  // for MULTIPLAYER: the manifest is generated from the same data folder the sim peer runs
+  // (ensureVanillaManifest <- gameDataDir), so a client missing Tribunal/Bloodmoon cannot
+  // match the world's content list and ContentGate refuses it at the join. Marking them
+  // optional outright would not grant anybody access — it would only move the refusal from
+  // "the wizard will not finish" to "you uploaded four gigabytes and THEN got kicked", which
+  // is the regression play/launcher.html's own local-folder check exists to prevent.
+  //
+  // `soloOptional` is the missing distinction. The locker is also the cloud SINGLE-PLAYER
+  // library (launcher's `cloud=1` door: same account, same files, no world at all), and a
+  // session with no world has no content list to match. There the expansions are exactly what
+  // they are in retail — extra content — and blocking a Morrowind-only owner on them was
+  // never justified by anything. So the row stays required, and carries a flag saying WHO it
+  // is required for; the client demotes it when there is no world (play/index.html `needs`).
+  //
+  // Kept as an ADDITIVE flag rather than flipping `required` because the game page and this
+  // server deploy from two different workflows: for the minutes between them an older cached
+  // index.html reads this list, and it must keep seeing the strict answer it understands.
+  requiredManifest(): LockerNeed[] {
     const byName = new Map<string, { name: string; size: number }>();
     for (const f of this.vanilla.files) {
       if (f.name.includes('/')) continue; // media is summarised as folder rows below
@@ -287,8 +354,12 @@ export class Locker {
       // If distributions differ in size, show the smallest (any real copy clears the ±5% gate).
       if (!prev || f.size < prev.size) byName.set(k, { name: f.name, size: f.size });
     }
-    const out: { name: string; size: number; required: boolean; media?: boolean }[] = [...byName.values()]
-      .map((f) => ({ ...f, required: true }))
+    const out: LockerNeed[] = [...byName.values()]
+      .map((f) => ({
+        ...f,
+        required: true,
+        ...(EXPANSION.test(f.name) ? { soloOptional: true } : {}),
+      }))
       .sort((a, b) => a.name.localeCompare(b.name));
 
     // Media as ONE ROW PER FOLDER rather than 6,443 rows nobody can read. These are REQUIRED:
@@ -446,6 +517,9 @@ export class Locker {
       try { await storage.delete(key); } catch { /* already gone is fine */ }
       const files = await this.filesOf(accountKey);
       this.putFiles(accountKey, files.filter((f) => f.name !== MEDIA_PACK));
+      // Leave the verdict where the player can be told it. Without this the deletion is
+      // invisible from the browser and the wizard can only ask for the same upload again.
+      this.setMediaStatus(accountKey, reason, typeof detail.name === 'string' ? detail.name : undefined);
     };
     let url: string;
     try { url = await storage.presignGet(key); } catch (err) { return fail('presign', { error: String(err) }); }
@@ -493,6 +567,23 @@ export class Locker {
       buf = buf.subarray(512 + padded);
     }
     log('info', 'locker.media_pack_verified', { account: accountKey, entries });
+    this.setMediaStatus(accountKey, 'ok');
+  }
+
+  private setMediaStatus(accountKey: string, reason: string, detail?: string): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO locker_media_status (accountKey, reason, detail, at) VALUES (?, ?, ?, ?)')
+      .run(accountKey, reason, detail ?? null, new Date().toISOString());
+  }
+
+  // The last verdict on this account's media pack, for the wizard to explain itself with.
+  // Undefined = never uploaded one, which is the ordinary first-visit case and not a failure.
+  mediaStatusOf(accountKey: string): { reason: string; detail?: string; at: string } | undefined {
+    const row = this.db
+      .prepare('SELECT reason, detail, at FROM locker_media_status WHERE accountKey = ?')
+      .get(accountKey) as { reason: string; detail: string | null; at: string } | undefined;
+    if (!row) return undefined;
+    return { reason: row.reason, ...(row.detail ? { detail: row.detail } : {}), at: row.at };
   }
 
   async filesOf(accountKey: string): Promise<LockerFile[]> {
@@ -532,6 +623,7 @@ export class Locker {
     // would be keeping a record about someone who asked to be forgotten.
     this.db.prepare('DELETE FROM locker_files WHERE accountKey = ?').run(accountKey);
     this.db.prepare('DELETE FROM locker_attestations WHERE accountKey = ?').run(accountKey);
+    this.db.prepare('DELETE FROM locker_media_status WHERE accountKey = ?').run(accountKey);
     log('info', 'locker.erased', { account: accountKey });
   }
 

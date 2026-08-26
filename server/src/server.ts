@@ -153,6 +153,35 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
   let worldMode = opts.worldMode ?? process.env.OMW_WORLD_MODE ?? 'public';
   const worldModeAtBoot = worldMode;
 
+  // THE SHARED LOBBY'S RULE FLOOR.
+  //
+  // The gateway's public world is a crowd of strangers with no stake in each other's game, and
+  // the shipped defaults are tuned for the opposite case — a handful of friends on a
+  // self-hosted server. Two of them are actively wrong in a lobby, and one of them the code
+  // already CLAIMED to enforce and did not (maySkipTime's comment read "Public worlds never
+  // skip time" while it read a config value that defaults to "anyone").
+  //
+  // The predicate is deliberately `OMW_WORLD_ID && public`, not `public` — the same one
+  // lobbyWorld and chargenGate use. A standalone self-hosted server also defaults to
+  // worldMode 'public', but it IS that operator's real game, and imposing lobby rules on it
+  // would be this file overruling their config for no reason.
+  //
+  // A FLOOR, NOT AN OVERRIDE: an operator who has stated a value in config.toml keeps it.
+  // Only the shipped defaults are replaced, so this cannot silently undo a deliberate choice.
+  const isSharedLobby = !!process.env.OMW_WORLD_ID && worldModeAtBoot === 'public';
+  if (isSharedLobby) {
+    const stated = config.stated ?? new Set<string>();
+    // One stranger must not fast-forward a hundred people into the night.
+    if (!stated.has('rules.timeSkip')) config.rules.timeSkip = 'off';
+    // Give the lobby something to do that is not chat. Wilderness-only, so towns, shops and
+    // guildhalls stay places you can stand still in; party members are already exempt.
+    if (!stated.has('rules.pvp')) config.rules.pvp = true;
+    if (!stated.has('rules.pvpZone')) config.rules.pvpZone = 'wilderness';
+    log('info', 'world.lobby_rules', {
+      timeSkip: config.rules.timeSkip, pvp: config.rules.pvp, pvpZone: config.rules.pvpZone,
+    });
+  }
+
   // Background writes still in flight. close() drains these BEFORE shutting the stores, so a
   // fire-and-forget write can never land on a closed database — which both throws an unhandled
   // rejection and LOSES the write. ChargenComplete is the one that hurts: the flag it sets is
@@ -165,7 +194,16 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
     void p.catch(() => undefined).finally(() => inFlight.delete(p));
   };
   const worldOwner = (opts.worldOwner ?? process.env.OMW_WORLD_OWNER ?? '').toLowerCase();
-  const playerStore = new PlayerStore(sharedDir, worldId);
+  // LOBBY MODE for the gateway's shared world: character docs are read-only there, so nothing
+  // looted, dropped or lost in the lobby follows anyone home. Same predicate as the rule floor
+  // above and as ctx.lobbyWorld below — a STANDALONE public server is somebody's real game and
+  // must keep saving. Retention matches the resume window: coming back inside it is a
+  // reconnect, past it you get your real character.
+  const playerStore = new PlayerStore(sharedDir, worldId, {
+    lobby: isSharedLobby,
+    lobbyRetainMs: Math.max(0, config.login.resumeWindowSec) * 1000,
+  });
+  if (isSharedLobby) log('info', 'world.lobby_persistence', { writes: 'discarded' });
   // Onboarding CRM capture. Env var wins over toml so the key can stay out of config files
   // in deployments; empty = inert.
   const attio = new AttioHook({
@@ -249,6 +287,10 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
     cells: cellStore,
     records: recordStore,
     guiTimeoutMs: Math.round(config.gui.timeoutSec * 1000),
+    // Lobby only. Everywhere else a dropped item is somebody's property and wiping it would be
+    // destroying real progress; in the lobby nothing can ever leave, so the item on the ground
+    // could never have become anyone's. See M7.sweepLitter.
+    ...(isSharedLobby ? { litterSweepSec: config.cellReset.litterSweepSec } : {}),
     isMapShared: () => hooks.shareFamily('map'),
     // Public worlds never skip time; party worlds let the leader decide for the group.
     maySkipTime: (player) => {
@@ -280,6 +322,19 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
       return socialRef?.partyMembersOf(a.accountKey).includes(b.accountKey) ?? false;
     },
     cellOfPlayer: (playerId) => roster.get(playerId)?.cellKey,
+    posOfPlayer: (playerId) => {
+      const p = roster.get(playerId);
+      if (!p || p.cellKey === undefined || !p.pose) return undefined;
+      return { cellKey: p.cellKey, x: p.pose.x, y: p.pose.y, z: p.pose.z };
+    },
+    partyOfPlayer: (playerId) => {
+      const me = roster.get(playerId);
+      if (!me) return [];
+      const accts = socialRef?.partyMembersOf(me.accountKey) ?? [];
+      return roster.humansInWorld()
+        .filter((p) => p.id !== playerId && accts.includes(p.accountKey))
+        .map((p) => p.id);
+    },
     chat: (target, msg: ChatMessageBody) => {
       if (target === 'all') broadcastChat(roster, msg);
       else roster.get(target)?.peer.sendEvent('ChatMessage', msg);
@@ -373,11 +428,24 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
     return DECLARED_STATE_ANOMALIES.some((k) => (seen[k] ?? 0) > 0);
   };
   world.setQuarantineCheck(isQuarantined);
+  world.setDropEnforcement(config.economy.refuseUnownedDrops);
 
   world.setInventoryOracle((player, recordId) => {
     const inv = playerStore.getCached(player.charId)?.inventory;
-    if (!inv) return undefined;
-    return inv.find((i) => i.id === recordId)?.n ?? 0;
+    if (!inv) return undefined; // no doc to judge by: never treated as guilt
+    const declared = inv.find((i) => i.id === recordId)?.n ?? 0;
+    // ...plus anything acquired since that snapshot was taken. Without this the count is
+    // stale by up to the 2 s inventory diff, which is exactly long enough for "pick up, drop"
+    // to look like a drop of something you never had.
+    return declared + (player.pendingAcquired?.get(recordId) ?? 0);
+  });
+  world.setInventoryDebit((player, recordId, count) => {
+    const led = player.pendingAcquired;
+    const have = led?.get(recordId);
+    if (led === undefined || have === undefined) return;
+    const left = have - count;
+    if (left > 0) led.set(recordId, left);
+    else led.delete(recordId);
   });
   world.setModerationNote((accountKey, kind) => moderation.noteAnomaly(accountKey, kind));
 
@@ -444,6 +512,10 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
     },
   });
 
+  // Deliver swings that were parked while a cell had no simulator (combat.ts `hold`). Wired
+  // here because the world is built before the combat relay and neither should import the other.
+  world.onHolderGained = (cellKey) => combat.flushCell(cellKey);
+
   const quests = new Quests({
     roster,
     cells: cellStore,
@@ -490,6 +562,7 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
     store: socialStore,
     roster,
     worldId: worldId ?? 'default',
+    defaultPartyScaling: config.rules.partyScaling,
     // The USERNAME is the public handle (accounts.ts: "shown everywhere in-game — nametags,
     // chat, friends, admin views"). account.name is the LOGIN IDENTIFIER, and for an SSO
     // account it is the provider's name claim, i.e. the person's real name. Every social
@@ -530,7 +603,8 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
     // F3: only when a gateway is configured. Without one the Worlds tab reports that this
     // is a standalone world, which is an honest answer and a valid setup.
     ...(config.gateway.url
-      ? { worlds: new WorldBrowser({ gatewayUrl: config.gateway.url, ownPort: () => port }) }
+      ? { worlds: new WorldBrowser({ gatewayUrl: config.gateway.url,
+          serverToken: config.gateway.serverToken, ownPort: () => port }) }
       : {}),
   });
   socialRef = social;
@@ -557,7 +631,7 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
     accounts,
     roster,
     content: contentGate,
-    engine: new EngineGate(config.engine.enforce),
+    engine: new EngineGate(config.engine.enforce, config.engine.pin),
     loginLimiter: new IpRateLimiter(config.limits.loginPerMinPerIp),
     commands,
     commandCtx,
@@ -915,6 +989,9 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
   // because anchors are cheap now — the expensive thing was processes, and there is one.
   // Empty regions cost nothing: the engine already unloads cells no anchor covers.
   const WORLD_KEY = 'world';
+  let lastUncovered = ''; // throttle for simpeer.cells_unsimulated: one line per change
+  const peerAnchorSig = new Map<string, string>(); // peer key -> last SimAnchors payload sent
+  const claimedBy = new Map<string, Set<string>>(); // peer key -> cells it holds
   let lastAnchors = '';
   // Cells the peer currently holds because they are anchored, so the set can be diffed rather
   // than re-entered every tick (re-entering bumps the epoch and forces a full re-sync).
@@ -992,8 +1069,14 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
       else interiors.push(cell);
     }
 
-    // The peer's avatar has to stand somewhere, but it no longer matters WHERE: everything it
-    // must simulate is anchored. Prefer an exterior so a cold start lands somewhere sensible.
+    // WHERE THE PEER STANDS MATTERS. This comment used to say it did not -- that anchoring a
+    // cell was enough -- and that was wrong in the expensive direction. Anchoring makes the
+    // engine LOAD a cell; it does not make it tick the actors in it. OpenMW hard-clamps
+    // [Game] actors processing range to 7168 units against an 8192-wide cell (see
+    // core/movement.ts), so a peer only simulates near its own feet. Standing in the wrong
+    // place produced cells with a healthy holder and no actor frames at all: monsters that
+    // never attacked and melee that never landed, for every player except whoever happened to
+    // share the peer's cell. Prefer an exterior so a cold start lands somewhere sensible.
     //
     // NEVER a cell the sanctuary protects. This picked from the unfiltered human list, so a
     // lone player creating their character got the peer spawned ON TOP of them — the log read
@@ -1002,52 +1085,94 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
     // its own world, and it is one accident away from holding them. `cells` is already the
     // sanctuary-filtered set; fall back to nowhere rather than to a protected cell, and the
     // peer boots at [simPeer].startCell instead.
-    const placeable = humans.filter((p) => cells.includes(p.cellKey!));
-    const first = placeable.find((p) => parseExterior(p.cellKey!) !== null) ?? placeable[0];
-    simPeers.ensure(WORLD_KEY, first
-      ? { cellKey: first.cellKey!, x: first.pose?.x ?? 0, y: first.pose?.y ?? 0, z: first.pose?.z ?? 0 }
-      : undefined);
+    // ONE PEER PER OCCUPIED CELL. Anchoring makes an engine LOAD a cell; only standing in it
+    // makes the engine TICK its actors, because OpenMW clamps actors processing range to 7168
+    // units against an 8192-wide cell (core/movement.ts). A single peer therefore simulates
+    // exactly one cell no matter how many it anchors -- which on a multiplayer server means
+    // every player outside the peer's own cell watches frozen NPCs and swings through them.
+    //
+    // The supervisor was always built for this (`ensure()` takes a key AND a place to stand,
+    // `keys()` exists so callers can idle the clusters nobody occupies); it was only ever
+    // called with one global key. Now the key IS the cell.
+    const placeByCell = new Map<string, { cellKey: string; x: number; y: number; z: number }>();
+    for (const p of humans) {
+      const ck = p.cellKey;
+      if (!ck || !cells.includes(ck) || placeByCell.has(ck)) continue;
+      // A real player's position, so the peer lands on ground that exists rather than a
+      // computed cell centre that could be inside terrain.
+      placeByCell.set(ck, { cellKey: ck, x: p.pose?.x ?? 0, y: p.pose?.y ?? 0, z: p.pose?.z ?? 0 });
+    }
 
-    // Only on change: the peer re-runs its cell grid when the list moves, so resending an
-    // identical list every 5 s would churn loads for nothing.
-    const key = JSON.stringify([anchors, interiors]);
-    if (key !== lastAnchors) {
-      const peerPlayer = roster.inWorld().find((p) => p.system === true);
-      if (peerPlayer) {
-        // Recorded as sent ONLY once it has been. Assigning before this check meant that if
-        // the peer was still booting (measured 2-5s) on the tick the set changed, the send and
-        // the claim were skipped while the set was marked delivered — and for a lone player
-        // standing still it never changes again, so that session got no anchors at all.
-        lastAnchors = key;
-        peerPlayer.peer.sendEvent('SimAnchors', { anchors, interiors });
-        // AUTHORITY FOLLOWS THE ANCHORS. The peer keeps these cells loaded and ticks their
-        // actors, so it must also HOLD them — otherwise the cells players are standing in have
-        // no holder and their NPCs are frozen anyway, which was the whole bug. Claiming a cell
-        // the peer does NOT anchor would be the opposite error: a healthy-looking holder over a
-        // region it never simulates, which nothing can detect from the outside.
-        const want = new Set(cells);
-        for (const gone of [...claimed].filter((c) => !want.has(c))) {
-          world.authorityLeave(peerPlayer.id, gone, true);
-          claimed.delete(gone);
-        }
-        for (const c of want) {
-          if (claimed.has(c)) continue;
-          world.authorityEnter(peerPlayer, c);
-          claimed.add(c);
-        }
+    // Nearest-first so that when there are more occupied cells than [simPeer].maxPeers, the cap
+    // falls on the same cells each pass instead of flapping between them every 5s.
+    for (const ck of [...placeByCell.keys()].sort()) simPeers.ensure(ck, placeByCell.get(ck)!);
+
+    // Cells nobody occupies any more: idle rather than kill, so a player stepping back in does
+    // not pay a cold start (retail data takes tens of seconds to load).
+    for (const k of simPeers.keys()) if (!placeByCell.has(k)) simPeers.markIdle(k);
+    simPeers.sweep();
+
+    // Each peer is told about ITS OWN cell only, and holds only that. Handing a peer anchors it
+    // cannot simulate is what produced healthy-looking holders over frozen regions.
+    const seenKeys = new Set<string>();
+    for (const peerPlayer of roster.inWorld().filter((p) => p.system === true)) {
+      const key = simPeers.keyOfAccount(peerPlayer.name);
+      if (key === undefined) continue; // a peer we did not start; leave it alone
+      seenKeys.add(key);
+      const place = placeByCell.get(key);
+      if (!place) continue; // its cell emptied; the idle sweep above will retire it
+      const e = parseExterior(key);
+      const mine = { anchors: e ? [{ x: e.x, y: e.y }] : [], interiors: e ? [] : [key] };
+      const sig = JSON.stringify([key, mine, place]);
+      if (peerAnchorSig.get(key) !== sig) {
+        peerAnchorSig.set(key, sig);
+        peerPlayer.peer.sendEvent('SimAnchors', { ...mine, place });
       }
-      // worldId, and WHY each occupied cell was dropped. Without these the line is unreadable:
-      // one container runs several worlds and every one of them logs this, so a public world's
-      // anchors look exactly like a private world's, and "the peer anchored the cell my
-      // chargen player is standing in" cannot be told apart from "a different world did
-      // something normal".
+      // AUTHORITY FOLLOWS THE PEER THAT CAN ACTUALLY SIMULATE. Claiming a cell a peer does not
+      // stand in is the opposite error: a healthy holder over a region nothing ticks, which
+      // cannot be detected from outside.
+      const held = claimedBy.get(key) ?? new Set<string>();
+      for (const gone of [...held].filter((c) => c !== key)) {
+        world.authorityLeave(peerPlayer.id, gone, true);
+        held.delete(gone);
+      }
+      if (!held.has(key)) {
+        world.authorityEnter(peerPlayer, key);
+        held.add(key);
+      }
+      claimedBy.set(key, held);
+    }
+
+    // Forget bookkeeping for peers that are gone, so these maps cannot grow without bound.
+    for (const k of [...peerAnchorSig.keys()]) if (!seenKeys.has(k)) peerAnchorSig.delete(k);
+    for (const k of [...claimedBy.keys()]) if (!seenKeys.has(k)) claimedBy.delete(k);
+
+    // Coverage shortfall is a real condition, not an anomaly to infer from silence: more
+    // occupied cells than the cap allows means somebody IS watching frozen NPCs right now.
+    const uncovered = [...placeByCell.keys()].filter((c) => !seenKeys.has(c));
+    if (uncovered.length > 0 && uncovered.join(',') !== lastUncovered) {
+      lastUncovered = uncovered.join(',');
+      log('warn', 'simpeer.cells_unsimulated', {
+        unsimulated: uncovered.join(','), peers: seenKeys.size, cap: config.simPeer.maxPeers,
+        note: 'raise [simPeer].maxPeers, at roughly 450MB per peer',
+      });
+    } else if (uncovered.length === 0 && lastUncovered !== '') {
+      lastUncovered = '';
+    }
+
+    // worldId, and WHY each occupied cell was dropped: one container runs several worlds and
+    // every one logs this, so without it a public world's anchors read exactly like a private
+    // world's. `simulating` is now per-peer, which is the thing that actually determines
+    // whether the NPCs in a cell move.
+    const anchorLine = [...seenKeys].sort().join(',');
+    if (anchorLine !== lastAnchors) {
+      lastAnchors = anchorLine;
       log('info', 'simpeer.anchors', {
         world: worldId, exteriors: anchors.length, interiors: interiors.length,
         occupied: humans.map((p) => `${p.name}@${p.cellKey}${p.inChargen === true ? ' [chargen]' : ''}`),
-        anchored: cells,
+        anchored: cells, simulating: anchorLine,
       });
     }
-    simPeers.sweep();
   };
   const simPeerTick = setInterval(simPeerPass, 5_000);
   // Loot rolls: sweep() is what settles a roll whose voter disconnected — without a caller,
@@ -1211,6 +1336,7 @@ export async function startServer(opts: StartOptions): Promise<RunningServer> {
         cellKey: config.rules.respawnCellKey,
         x: config.rules.respawnX, y: config.rules.respawnY, z: config.rules.respawnZ,
       },
+      looks: config.dev.botLooks,
       look: {
         race: config.dev.botRace, head: config.dev.botHead,
         hair: config.dev.botHair, class: config.dev.botClass,

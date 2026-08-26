@@ -27,6 +27,14 @@ local CONTAINER_WATCH_SECONDS = 15 -- native container UI has no close signal; p
 local CONTAINER_POLL = 0.25
 local LOCK_WATCH_SECONDS = 4
 local DOOR_READ_DELAY = 0.4 -- door starts turning on activation; read the resulting state
+-- Containers get the same treatment for a sharper reason. Morrowind resolves a container's
+-- LEVELED LOOT the first time it is activated, so reading the contents inside onActivate can
+-- catch it before the engine has populated it. That read is not just wrong once: the server
+-- takes the FIRST opener's contents as canonical and never overwrites them
+-- (worldstate.ts containerOpen), so an empty first read makes the container permanently empty
+-- for everybody, and the client then forces that emptiness back onto the object on every open.
+-- Reported as a plant that opens blank and stays blank. Read it a beat later instead.
+local CONTAINER_OPEN_DELAY = 0.2
 local ECHO_GUARD_SECONDS = 5
 
 local netToObj = {} -- netId -> GameObject
@@ -38,6 +46,12 @@ local opCounter = 0
 local pendingOps = {} -- opId -> {op=, itemId=, n=, key=, obj=}
 local recentPickups = {} -- obj.id -> time (belt+braces beside the byId echo skip)
 local doorPending = {} -- obj.id -> {obj=, at=}
+local containerOpenPending = {} -- obj.id -> {obj=, at=}: deferred first read, see above
+-- obj.id -> {obj=, slots=, until_=}: equipment to put back on an actor whose inventory was
+-- just rewritten by a canonical ContainerState. Retried rather than applied once, because the
+-- recreated items do not exist until a later frame.
+local equipPending = {}
+local EQUIP_RESTORE_WINDOW = 3.0 -- give up after this; a permanent retry would leak the entry
 local lockWatch = {} -- obj.id -> {obj=, locked=, level=, until_=}
 -- Phase 4: obj.id -> last seen `enabled`. Unlike locks, an enable/disable is not tied to
 -- an activation — a quest script flips it whenever it likes — so this is a low-rate poll
@@ -64,6 +78,28 @@ end
 
 -- Wire address for an object, or nil if it is a client-local dynamic object that has no
 -- netId yet (must not travel).
+-- A PLAYER ACTION THAT GOES NOWHERE SHOULD NOT DO IT QUIETLY.
+--
+-- The outbound paths below all have guards that return without sending: no address for the
+-- object, a chargen cell, no cell key. Every one of them is a real case, but the player still
+-- swung, opened or took something, and until now the game said nothing and the server logged
+-- nothing because it was never told. That is precisely how "plants are empty" looked from both
+-- ends: the container emptied locally and the server had no idea a container had been touched.
+--
+-- Throttled per (what, why) so a guard that trips every frame cannot flood the log, and mirrored
+-- into testSet so a scenario can assert on it.
+local dropOutAt = {}
+local DROP_OUT_EVERY = 5
+local function dropOut(what, why, detail)
+    local key = what .. '/' .. why
+    local now = core.getRealTime()
+    if dropOutAt[key] and now - dropOutAt[key] < DROP_OUT_EVERY then return end
+    dropOutAt[key] = now
+    pcall(function() mp.testSet('lastDropOut', key) end)
+    print(string.format('[mp] OUTBOUND DROPPED: %s why=%s%s', what, why,
+        detail and (' ' .. tostring(detail)) or ''))
+end
+
 local function addrOf(obj)
     local netId = objIdToNet[obj.id]
     if netId then return { net = netId } end
@@ -117,11 +153,17 @@ end
 
 local function sendAddressed(eventName, obj, extra)
     local addr = addrOf(obj)
-    if not addr then return false end
+    if not addr then
+        dropOut(eventName, 'unaddressable', tostring(obj.recordId))
+        return false
+    end
     extra = extra or {}
     for k, v in pairs(addr) do extra[k] = v end
     extra.cellKey = extra.cellKey or cellKeyOfObj(obj)
-    if isChargenCell(extra.cellKey) then return false end
+    if isChargenCell(extra.cellKey) then
+        dropOut(eventName, 'chargen-cell', tostring(extra.cellKey))
+        return false
+    end
     mp.sendEvent(eventName, extra)
     return true
 end
@@ -132,10 +174,41 @@ end
 
 -- ---------------------------------------------------------------- container helpers
 
-local function snapshotContainer(obj)
+-- WHERE A LOOTABLE OBJECT KEEPS ITS ITEMS. A chest keeps them in Container.content; a CORPSE
+-- keeps them in Actor.inventory, and a corpse is not a Container instance -- which is why
+-- looting a body was never reported to the server at all. Every client held its own copy of the
+-- dead NPC's inventory, so two players looting the same corpse each received the full loot and
+-- nothing anywhere noticed. On a server-authoritative design that is item duplication on every
+-- fight a party wins.
+--
+-- LIVE actors are deliberately excluded: activating one opens dialogue, not a container, and
+-- pickpocketing is its own mechanic with its own rules. Death is the line.
+-- allowLive is an explicit opt-in used ONLY by the barter path. Activating a live actor opens
+-- dialogue, not a container, so the activation path must never pass it -- but a merchant's
+-- stock IS a shared container while the barter window is open, and it is the same refKey the
+-- server already transacts on. Without this, two players could each buy the same unique item
+-- from the same trader and each sell into a purse that never emptied.
+local function lootStore(obj, allowLive)
+    if not (obj and obj:isValid()) then return nil end
+    if types.Container.objectIsInstance(obj) then return types.Container.content(obj) end
+    if types.Actor.objectIsInstance(obj) then
+        if allowLive then return types.Actor.inventory(obj) end
+        local ok, dead = pcall(function() return types.Actor.isDead(obj) end)
+        if ok and dead then return types.Actor.inventory(obj) end
+    end
+    return nil
+end
+
+local function isLootable(obj)
+    return lootStore(obj) ~= nil
+end
+
+local function snapshotContainer(obj, allowLive)
+    local store = lootStore(obj, allowLive)
+    if not store then return nil end
     local counts = {}
     local ok = pcall(function()
-        for _, item in ipairs(types.Container.content(obj):getAll()) do
+        for _, item in ipairs(store:getAll()) do
             counts[item.recordId] = (counts[item.recordId] or 0) + item.count
         end
     end)
@@ -165,8 +238,28 @@ end
 -- Force a real local container to the given contents (server truth). Global-context
 -- inventory surgery: remove everything, recreate. Coarse but deterministic.
 local function setContainerContents(obj, items)
-    if not (obj and obj:isValid() and types.Container.objectIsInstance(obj)) then return end
-    local content = types.Container.content(obj)
+    -- allowLive: reaching here means the SERVER holds canonical state for this refKey, which
+    -- is itself the authorisation. Refusing a live actor here would leave a merchant's stock
+    -- permanently out of step with the server that is arbitrating it.
+    local content = lootStore(obj, true)
+    if not content then return end
+    -- On a LIVE actor this store is the whole inventory, EQUIPPED ITEMS INCLUDED, and the
+    -- rewrite below destroys and recreates every object in it. Without this, applying a
+    -- merchant's canonical stock stripped that merchant naked on every other client: the
+    -- armour came back as a fresh unequipped copy. Slots are remembered by recordId rather
+    -- than by object because the objects themselves do not survive the rewrite --
+    -- setEquipment accepts a recordId and searches the store, which is exactly what is left.
+    local equipped = nil
+    if types.Actor.objectIsInstance(obj) then
+        local oke, eq = pcall(function() return types.Actor.getEquipment(obj) end)
+        if oke and eq then
+            equipped = {}
+            for slot, item in pairs(eq) do
+                local okr, rid = pcall(function() return item.recordId end)
+                if okr and rid then equipped[slot] = rid end
+            end
+        end
+    end
     pcall(function()
         for _, item in ipairs(content:getAll()) do
             item:remove()
@@ -176,14 +269,20 @@ local function setContainerContents(obj, items)
             if okc then created:moveInto(content) end
         end
     end)
+    -- DEFERRED, not inline. createObject+moveInto lands a frame or more later, so calling
+    -- setEquipment here finds an empty store and fails silently -- identity.lua hit exactly
+    -- this and says so. Retried from the tick until the replacements actually exist.
+    if equipped and next(equipped) then
+        equipPending[obj.id] = { obj = obj, slots = equipped, until_ = core.getRealTime() + EQUIP_RESTORE_WINDOW }
+    end
     -- Never re-diff a network apply as a local op.
     local watch = containerWatch[obj.id]
     if watch then watch.last = snapshotContainer(obj) or watch.last end
 end
 
 local function applyContainerDelta(obj, itemId, dn)
-    if not (obj and obj:isValid() and types.Container.objectIsInstance(obj)) then return end
-    local content = types.Container.content(obj)
+    local content = lootStore(obj, true)
+    if not content then return end
     pcall(function()
         if dn > 0 then
             local okc, created = pcall(function() return world.createObject(itemId, dn) end)
@@ -201,6 +300,28 @@ local function applyContainerDelta(obj, itemId, dn)
     end)
     local watch = containerWatch[obj.id]
     if watch then watch.last = snapshotContainer(obj) or watch.last end
+end
+
+-- Diff a watched container against its last snapshot and report every change. Extracted so the
+-- expiry path can run it too: the watch window closing does not mean nothing happened inside it.
+local function diffContainer(obj, watch)
+    local current = snapshotContainer(obj, watch.live)
+    if not current then
+        dropOut('ContainerOpRequest', 'contents-unreadable', tostring(obj.recordId))
+        return
+    end
+    local seen = {}
+    for recId, n in pairs(current) do
+        seen[recId] = true
+        local dn = n - (watch.last[recId] or 0)
+        if dn ~= 0 then objects.sendContainerOp(obj, dn < 0 and 'take' or 'put', recId, math.abs(dn)) end
+    end
+    for recId, n in pairs(watch.last) do
+        if not seen[recId] and n > 0 then
+            objects.sendContainerOp(obj, 'take', recId, n)
+        end
+    end
+    watch.last = current
 end
 
 local function trackContainerData(key, items, seq)
@@ -244,16 +365,98 @@ function objects.onActivate(object, actor)
         }
     end
 
-    if types.Container.objectIsInstance(object) then
-        local snapshot = snapshotContainer(object)
-        if snapshot and sendAddressed('ContainerOpen', object, { contents = countsToItems(snapshot) }) then
-            containerWatch[object.id] = {
-                obj = object,
-                last = snapshot,
-                nextPoll = now + CONTAINER_POLL,
-                until_ = now + CONTAINER_WATCH_SECONDS,
-            }
+    -- Chests AND corpses: both are lootable, both must be reported, or the items in them
+    -- duplicate across everyone who opens them.
+    if isLootable(object) then
+        -- Deferred: the contents may not exist yet at this instant (see CONTAINER_OPEN_DELAY).
+        containerOpenPending[object.id] = { obj = object, at = now + CONTAINER_OPEN_DELAY }
+    end
+end
+
+-- The deferred half of a container open: snapshot the contents once the engine has actually
+-- populated them, tell the server, and start watching for takes from that same snapshot.
+local function openContainerNow(object, now, live)
+    if not (object and object:isValid()) then return end
+    local snapshot = snapshotContainer(object, live)
+    -- A merchant's purse rides the open alongside its stock: same object, same refKey, and it
+    -- becomes canonical on the same first-opener rule.
+    local gold = nil
+    if live and types.Actor.objectIsInstance(object) then
+        local okg, g = pcall(function() return types.Actor.getBarterGold(object) end)
+        if okg and type(g) == 'number' then gold = g end
+    end
+    if snapshot and sendAddressed('ContainerOpen', object,
+            { contents = countsToItems(snapshot), gold = gold }) then
+        containerWatch[object.id] = {
+            obj = object,
+            last = snapshot,
+            live = live, -- a merchant stays alive while we watch it; a corpse does not
+            gold = gold, -- baseline to diff the purse against when the window closes
+            -- Poll on the NEXT tick, not a quarter second from now. A harvest can resolve and the
+            -- object can go away inside that gap, and the take is then unreportable.
+            nextPoll = 0,
+            until_ = now + CONTAINER_WATCH_SECONDS,
+        }
+        return
+    end
+    -- SELF-SILENCING DIAGNOSTIC. Reaching here means the container was activated but NO watch
+    -- was registered, so nothing this player takes from it will ever be reported: the take is
+    -- invisible to the server and the item's fate is decided by whatever trues the cell up next.
+    --
+    -- Three ways to get here, and this says WHICH, because they need different fixes: no
+    -- snapshot (Container.content did not read), not addressable (no netId and no contentFile),
+    -- or a chargen cell (deliberate, local-only).
+    local why
+    if not snapshot then
+        why = 'no snapshot (Container.content unreadable)'
+    elseif not addrOf(object) then
+        why = 'not addressable (no netId, no contentFile)'
+    elseif isChargenCell(cellKeyOfObj(object)) then
+        why = 'chargen cell (local-only by design)'
+    else
+        why = 'sendAddressed refused'
+    end
+    print(string.format('[mp] CONTAINER NOT WATCHED: %s cell=%s why=%s',
+        tostring(object.recordId), tostring(cellKeyOfObj(object)), why))
+end
+
+-- BARTER. A merchant's stock is shared state for exactly as long as the window is open, and it
+-- is the same refKey the server already transacts containers on -- so this reuses the whole
+-- container path rather than inventing a second one: deferred open, take/put watch, and
+-- ContainerOpRequest arbitrated server-side. What it buys is that two players can no longer each
+-- buy the SAME unique item from the same trader.
+--
+-- The deferred read matters here for the same reason it does for a chest: a merchant restocks
+-- on open, so reading the instant the window appears can catch the stock before it is refilled
+-- and make an empty shop canonical forever.
+function objects.onBarterOpen(merchant)
+    if not (merchant and merchant:isValid()) then return end
+    local now = core.getRealTime()
+    containerOpenPending[merchant.id] = { obj = merchant, at = now + CONTAINER_OPEN_DELAY, live = true }
+end
+
+-- Closing the window is the moment to reconcile: the engine has finished moving items both
+-- ways, so one final diff reports the whole trade rather than a stream of intermediate states.
+function objects.onBarterClose()
+    local now = core.getRealTime()
+    for id, watch in pairs(containerWatch) do
+        if watch.live and watch.obj and watch.obj:isValid() then
+            diffContainer(watch.obj, watch)
+            -- The purse delta, reported once for the whole trade. A DELTA rather than the new
+            -- total: two players trading with one merchant at the same time would each compute
+            -- a different absolute from their own view and the later write would erase the
+            -- earlier trade. Deltas commute, so both land.
+            if watch.gold ~= nil then
+                local okg, nowGold = pcall(function() return types.Actor.getBarterGold(watch.obj) end)
+                if okg and type(nowGold) == 'number' and nowGold ~= watch.gold then
+                    objects.sendGoldOp(watch.obj, math.floor(nowGold - watch.gold))
+                end
+            end
+            containerWatch[id] = nil
         end
+    end
+    for id, pending in pairs(containerOpenPending) do
+        if pending.live then containerOpenPending[id] = nil end
     end
 end
 
@@ -405,16 +608,26 @@ handlers.MP_DoorState = function(data)
     end
 end
 
+-- The merchant's purse is server truth like the stock. Applied whenever it is present so a
+-- trader a second player already traded with does not offer THIS player a full purse again.
+local function applyMerchantGold(obj, gold)
+    if not (obj and obj:isValid()) or type(gold) ~= 'number' then return end
+    if not types.Actor.objectIsInstance(obj) then return end
+    pcall(function() types.Actor.setBarterGold(obj, math.max(0, math.floor(gold))) end)
+end
+
 handlers.MP_ContainerState = function(data)
     local obj = resolveBody(data)
     local key = data.net and netKey(data.net) or (obj and refKeyOfObj(obj))
     if key then trackContainerData(key, data.items or {}, data.stateSeq) end
     if obj then setContainerContents(obj, data.items or {}) end
+    applyMerchantGold(obj, data.gold)
 end
 
 handlers.MP_ContainerUpdate = function(data)
     local obj = resolveBody(data)
     local key = data.net and netKey(data.net) or (obj and refKeyOfObj(obj))
+    applyMerchantGold(obj, data.gold)
     local delta = data.delta or {}
     if key then
         local tracked = containerData[key] or { items = {}, seq = 0 }
@@ -448,6 +661,24 @@ handlers.MP_ContainerOpResult = function(data)
     -- Lost the race ("gone"): undo the optimistic local take — the item leaves the player
     -- inventory again, and the container is trued up by the ResyncRequest cell state.
     print('[mp] container op rejected: ' .. tostring(data.reason))
+    -- TELL THEM. The undo below removes the item from the player's inventory again, so from
+    -- their side a thing they just picked up vanishes on its own. "gone" is the ordinary case
+    -- and it is not an error: somebody else reached the container first.
+    -- The five the server actually sends (worldstate.ts containerOp): nostate, contained,
+    -- gone, rolling, full. `rolling` is the one that most needs saying — with party loot rolls
+    -- on, grabbing a rare item refuses the take and starts a roll instead, so silence reads as
+    -- the game ignoring you at the exact moment it is doing something interesting.
+    if deps.noticeFn then
+        local why = {
+            gone = 'Somebody else took that first.',
+            rolling = 'The party is rolling for that one.',
+            full = 'You cannot carry any more of that.',
+            contained = 'That cannot be moved directly.',
+            nostate = 'That container is still opening — try again.',
+        }
+        deps.noticeFn(why[tostring(data.reason or '')]
+            or (op.op == 'take' and 'You could not take that.' or 'That would not go in.'))
+    end
     if op.op == 'take' then
         local player = deps.playerFn()
         if player then
@@ -591,6 +822,36 @@ function objects.tick(now)
         end
     end
 
+    for id, pending in pairs(containerOpenPending) do
+        if now >= pending.at then
+            containerOpenPending[id] = nil
+            openContainerNow(pending.obj, now, pending.live)
+        end
+    end
+
+    -- Put equipment back once the recreated items have landed. Applied the moment they are
+    -- all present, and abandoned at the deadline so a record that never rematerialises (a
+    -- mod removed between sessions, say) does not retry for the life of the session.
+    for id, pending in pairs(equipPending) do
+        local obj = pending.obj
+        if not (obj and obj:isValid()) then
+            equipPending[id] = nil
+        else
+            local have = {}
+            local okinv = pcall(function()
+                for _, item in ipairs(types.Actor.inventory(obj):getAll()) do have[item.recordId] = true end
+            end)
+            local ready = okinv
+            for _, rid in pairs(pending.slots) do
+                if not have[rid] then ready = false end
+            end
+            if ready or now > pending.until_ then
+                equipPending[id] = nil
+                pcall(function() types.Actor.setEquipment(obj, pending.slots) end)
+            end
+        end
+    end
+
     for id, pending in pairs(doorPending) do
         if now >= pending.at then
             doorPending[id] = nil
@@ -620,25 +881,22 @@ function objects.tick(now)
 
     for id, watch in pairs(containerWatch) do
         local obj = watch.obj
-        if now > watch.until_ or not obj:isValid() then
+        if not obj:isValid() then
+            -- The object went away while we were watching it. Whatever was taken since the last
+            -- poll is UNREPORTABLE now -- the contents cannot be read and the object cannot be
+            -- addressed -- so say so rather than dropping the watch in silence. A harvested plant
+            -- that disables itself lands here.
+            dropOut('ContainerOpRequest', 'object-gone-while-watched', tostring(id))
+            containerWatch[id] = nil
+        elseif now > watch.until_ then
+            -- FINAL DIFF BEFORE LETTING GO. The window expiring is not evidence that nothing was
+            -- taken in it: the object is still valid here, so read it one last time. Dropping the
+            -- watch without this lost every take made in the last poll interval.
+            diffContainer(obj, watch)
             containerWatch[id] = nil
         elseif now >= watch.nextPoll then
             watch.nextPoll = now + CONTAINER_POLL
-            local current = snapshotContainer(obj)
-            if current then
-                local seen = {}
-                for recId, n in pairs(current) do
-                    seen[recId] = true
-                    local dn = n - (watch.last[recId] or 0)
-                    if dn ~= 0 then objects.sendContainerOp(obj, dn < 0 and 'take' or 'put', recId, math.abs(dn)) end
-                end
-                for recId, n in pairs(watch.last) do
-                    if not seen[recId] and n > 0 then
-                        objects.sendContainerOp(obj, 'take', recId, n)
-                    end
-                end
-                watch.last = current
-            end
+            diffContainer(obj, watch)
         end
     end
 
@@ -675,10 +933,18 @@ function objects.tick(now)
 end
 
 function objects.sendContainerOp(obj, op, itemId, n)
-    if isChargenCell(cellKeyOfObj(obj)) then return nil end -- tutorial cells are local-only
+    if isChargenCell(cellKeyOfObj(obj)) then
+        dropOut('ContainerOpRequest', 'chargen-cell', tostring(obj.recordId))
+        return nil -- tutorial cells are local-only, by design
+    end
     opCounter = opCounter + 1
     local addr = addrOf(obj)
-    if not addr then return nil end
+    if not addr then
+        -- No netId and no contentFile: nothing on the wire can name this object, so the take or
+        -- put cannot be reported at all. The item still moved locally.
+        dropOut('ContainerOpRequest', 'unaddressable', tostring(obj.recordId))
+        return nil
+    end
     pendingOps[opCounter] = { op = op, itemId = itemId, n = n, key = refKeyOfObj(obj), obj = obj, at = core.getRealTime() }
     local body = { opId = opCounter, op = op, itemId = itemId, n = n, cellKey = cellKeyOfObj(obj) }
     for k, v in pairs(addr) do body[k] = v end
@@ -687,6 +953,23 @@ function objects.sendContainerOp(obj, op, itemId, n)
 end
 
 -- Direct-address variant for test commands driving a container we only know by netId.
+-- Merchant purse delta. Same addressing and refusal protocol as a take/put, so it inherits the
+-- chargen-cell and unaddressable guards rather than needing its own.
+function objects.sendGoldOp(obj, delta)
+    if delta == 0 then return nil end
+    if isChargenCell(cellKeyOfObj(obj)) then return nil end
+    local addr = addrOf(obj)
+    if not addr then
+        dropOut('ContainerOpRequest', 'unaddressable-gold', tostring(obj.recordId))
+        return nil
+    end
+    opCounter = opCounter + 1
+    local body = { opId = opCounter, op = 'gold', goldDelta = delta, cellKey = cellKeyOfObj(obj) }
+    for k, v in pairs(addr) do body[k] = v end
+    mp.sendEvent('ContainerOpRequest', body)
+    return opCounter
+end
+
 function objects.sendContainerOpByNet(netId, op, itemId, n, cellKey)
     opCounter = opCounter + 1
     pendingOps[opCounter] = { op = op, itemId = itemId, n = n, key = netKey(netId), obj = netToObj[netId], at = core.getRealTime() }
@@ -734,6 +1017,7 @@ function objects.reset()
     pendingOps = {}
     recentPickups = {}
     doorPending = {}
+    containerOpenPending = {}
     lockWatch = {}
     enableWatch = {}
     nextEnablePoll = 0

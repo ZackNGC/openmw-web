@@ -57,7 +57,16 @@ export interface CellDoc {
   // already standing there has no idea what was originally inside, and TES3MP's answer —
   // kick everyone, or let them desync — is the failure this exists to avoid. It also
   // makes merchant gold come back, the other half of that same complaint.
-  containers: Record<string, { items: ContainerItems; stateSeq: number; origin?: ContainerItems }>;
+  // `gold` is a MERCHANT's purse, present only for containers that are actually traders.
+  // It has to be canonical for the same reason the stock does: left per-client, every player
+  // sells into a purse that never empties, which is the other half of the merchant
+  // duplication. Trainers touch this field and nothing else.
+  // `goldRestockAt` is an ABSOLUTE game-hour reading, not a wall clock: a merchant restocks
+  // on the world's calendar, which players can push forward by resting.
+  containers: Record<string, {
+    items: ContainerItems; stateSeq: number; origin?: ContainerItems;
+    gold?: number; goldOrigin?: number; goldRestockAt?: number;
+  }>;
   // M4: last actor snapshot folded when the cell went dormant ({actors:[...]}, JSON-safe),
   // and per-actor highest processed deathNo (dedup + death persistence).
   actorOverrides?: unknown;
@@ -269,8 +278,14 @@ export class CellStore {
         // "first open" and adopts the opener's client-declared contents as canonical, so the
         // very next open after a reset re-seeded the full roll. A row that persists means
         // there is no "first open" ever again.
+        // gold rides along for the same reason the row does: dropping it re-arms the faucet
+        // for the PURSE, because containerOpen adopts the opener's client-declared gold when
+        // the field is missing. A carried-forward merchant stays as drained as it was.
         doc.containers[key] = { items: cont.items.map((i) => ({ ...i })), stateSeq: cont.stateSeq + 1,
-          ...(cont.origin ? { origin: cont.origin.map((i) => ({ ...i })) } : {}) };
+          ...(cont.origin ? { origin: cont.origin.map((i) => ({ ...i })) } : {}),
+          ...(cont.gold !== undefined ? { gold: cont.gold } : {}),
+          ...(cont.goldOrigin !== undefined ? { goldOrigin: cont.goldOrigin } : {}),
+          ...(cont.goldRestockAt !== undefined ? { goldRestockAt: cont.goldRestockAt } : {}) };
         continue;
       }
       if (!cont.origin) continue; // pre-restock doc: nothing to restore it to
@@ -278,7 +293,11 @@ export class CellStore {
       // stateSeq keeps CLIMBING across a reset. A client that reconnects mid-reset must
       // never see a lower seq than one it already applied, or its own staleness guard
       // would reject the restock as an out-of-date frame.
-      doc.containers[key] = { items, stateSeq: cont.stateSeq + 1, origin: cont.origin.map((i) => ({ ...i })) };
+      // A restock refills the purse too -- a merchant whose stock is back but whose gold is
+      // still zero cannot buy anything, which is half a restock.
+      doc.containers[key] = { items, stateSeq: cont.stateSeq + 1, origin: cont.origin.map((i) => ({ ...i })),
+        ...(cont.goldOrigin !== undefined ? { gold: cont.goldOrigin, goldOrigin: cont.goldOrigin } : {}),
+        ...(cont.goldRestockAt !== undefined ? { goldRestockAt: cont.goldRestockAt } : {}) };
     }
     this.cache.set(cellKey, doc);
     this.dirty.add(cellKey);
@@ -296,6 +315,25 @@ export class CellStore {
     const doc = row ? (JSON.parse(row.doc) as CellDoc) : emptyCellDoc();
     this.cache.set(cellKey, doc);
     return doc;
+  }
+
+  /** Every cell this world has stored deltas for — i.e. every cell somebody has CHANGED.
+   *
+   *  Exactly the set that accumulates litter, and nothing else: a cell nobody has touched has
+   *  no row, so this never proposes resetting the whole map. Reads the table rather than the
+   *  cache because the cache only holds what is currently loaded, and litter outlives that. */
+  cellsWithDeltas(): string[] {
+    try {
+      const rows = this.db.prepare('SELECT cellKey FROM cells').all() as { cellKey: string }[];
+      const keys = new Set(rows.map((r) => r.cellKey));
+      // Dirty-but-unflushed cells live only in memory until the next sweep; a litter pass
+      // that ran between a drop and its flush would otherwise miss the cell entirely.
+      for (const k of this.dirty) keys.add(k);
+      return [...keys];
+    } catch (err) {
+      log('error', 'world.cell_list_failed', { error: String(err) });
+      return [];
+    }
   }
 
   getCached(cellKey: string): CellDoc | undefined {

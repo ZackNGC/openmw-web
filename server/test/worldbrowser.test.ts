@@ -6,6 +6,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { WorldBrowser } from '../src/core/worldbrowser';
 import type { Player } from '../src/core/players';
+import { loadConfig } from '../src/config';
+import { tmpDataDir } from './helpers';
 
 const player = (accountKey: string): Player => ({
   id: 1, name: accountKey, accountKey, charId: accountKey, rank: 0,
@@ -30,7 +32,7 @@ test('world browser: disabled without a gateway, and says so rather than looking
 test('world browser: the account comes from the SESSION, never from the client', async () => {
   let sawUrl = '';
   let sawBody = '';
-  const wb = new WorldBrowser({
+  const wb = new WorldBrowser({ serverToken: 'platform-secret',
     gatewayUrl: 'http://gw',
     fetchImpl: fakeGateway((url, init) => {
       sawUrl = url;
@@ -48,7 +50,7 @@ test('world browser: the account comes from the SESSION, never from the client',
 });
 
 test('world browser: a wedged gateway does not hang the player', async () => {
-  const wb = new WorldBrowser({
+  const wb = new WorldBrowser({ serverToken: 'platform-secret',
     gatewayUrl: 'http://gw',
     timeoutMs: 50,
     // A gateway that answers far too slowly. The real AbortSignal.timeout must cut it off;
@@ -69,7 +71,7 @@ test('world browser: a wedged gateway does not hang the player', async () => {
 });
 
 test('world browser: gateway refusals are translated into reasons the UI can explain', async () => {
-  const mk = (status: number) => new WorldBrowser({
+  const mk = (status: number) => new WorldBrowser({ serverToken: 'platform-secret',
     gatewayUrl: 'http://gw',
     fetchImpl: fakeGateway(() => new Response(JSON.stringify({ error: 'x' }), { status })),
   });
@@ -80,7 +82,7 @@ test('world browser: gateway refusals are translated into reasons the UI can exp
 
 test('world browser: bad input is rejected before it reaches the gateway', async () => {
   let called = false;
-  const wb = new WorldBrowser({
+  const wb = new WorldBrowser({ serverToken: 'platform-secret',
     gatewayUrl: 'http://gw',
     fetchImpl: fakeGateway(() => { called = true; return new Response('{}', { status: 200 }); }),
   });
@@ -91,7 +93,7 @@ test('world browser: bad input is rejected before it reaches the gateway', async
 });
 
 test('world browser: a successful list is passed through', async () => {
-  const wb = new WorldBrowser({
+  const wb = new WorldBrowser({ serverToken: 'platform-secret',
     gatewayUrl: 'http://gw',
     ownPort: () => 1234,
     fetchImpl: fakeGateway(() => new Response(JSON.stringify({
@@ -102,4 +104,39 @@ test('world browser: a successful list is passed through', async () => {
   assert.equal(r.worlds.length, 1);
   assert.equal(r.worlds[0]!.playerCount, 3);
   assert.equal(wb.ownPort, 1234, 'the world reports its own port so the UI can mark "you are here"');
+});
+
+test('world browser: without a platform credential, creating a world fails CLOSED', async () => {
+  // A world server proves it is part of the platform with a shared credential; the gateway
+  // takes the account from the caller's identity and never from the body. If the credential
+  // is not configured there is no trust path at all, and the honest answer is to refuse --
+  // not to send an unauthenticated request the gateway will bounce with an opaque 401, which
+  // is what a whole afternoon of triage went into diagnosing.
+  let called = false;
+  const wb = new WorldBrowser({
+    gatewayUrl: 'http://gw.invalid',
+    fetchImpl: (async () => { called = true; return new Response('{}', { status: 200 }); }) as typeof fetch,
+  });
+  const r = await wb.create({ accountKey: 'alice' } as never, 'my-session', 'private');
+  assert.equal(r.error, 'no_server_token');
+  assert.equal(called, false, 'and it must not even ask the gateway');
+});
+
+test('the gateway credential generates itself, and both halves get the SAME one', async () => {
+  // Requiring an operator to invent and paste a secret means the feature is silently dead on
+  // every deployment that forgets. The gateway and every world it spawns read the same shared
+  // dir, so a file there is the one place both halves are guaranteed to agree.
+  const shared = tmpDataDir();
+  const gateway = loadConfig(tmpDataDir(), undefined, shared);
+  assert.ok(gateway.gateway.serverToken.length > 20, 'a credential is minted on first load');
+
+  // A WORLD the gateway spawned: its own data dir is empty, the shared dir is the same.
+  const world = loadConfig(tmpDataDir(), undefined, shared);
+  assert.equal(world.gateway.serverToken, gateway.gateway.serverToken,
+    'the world must present the credential the gateway will recognise — a per-process secret '
+    + 'would refuse every create, differently on each restart');
+
+  // An operator who wants to manage it still wins.
+  const explicit = loadConfig(tmpDataDir(), { gateway: { serverToken: 'mine' } }, shared);
+  assert.equal(explicit.gateway.serverToken, 'mine', 'an explicit value overrides the minted one');
 });

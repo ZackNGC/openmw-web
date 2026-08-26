@@ -3,6 +3,17 @@
 #
 # Usage: deploy-test.sh engine|server
 #
+# Normally you do NOT run this by hand: it is the last stage of both Jenkins pipelines
+# (ci/jenkins/Jenkinsfile.engine and .server), and it runs on every green build. There is no
+# build-without-deploy, because an image that was never deployed has never been tested.
+#
+# TEST_HOST and SSH_KEY are resolved HERE, on the build server, inside the Jenkins container
+# -- not on a laptop. An ssh alias from somebody's ~/.ssh/config and a key path under their
+# home directory cannot resolve in that container, so config.env must carry a user@host and a
+# key the container can actually read ($HOME/.ssh/id_ed25519 works in both places). Getting
+# this wrong does not fail loudly: deploys keep working when run by hand and fail only from
+# Jenkins, so the job quietly stops being used and images start being built by hand instead.
+#
 # No registry: `docker save | ssh docker load` over the LAN is fast enough and is one less
 # moving part. If deploys get slow enough to annoy, stand up a registry on the build server.
 set -euo pipefail
@@ -78,6 +89,20 @@ $SSH "$TEST_HOST" "
   set -e
   sudo mkdir -p /opt/openmw-mp-test/data /opt/morrowind-test/data 2>/dev/null || true
   docker network create $NETWORK >/dev/null 2>&1 || true
+  # STOP IT PROPERLY FIRST. `docker rm -f` is SIGKILL, and this server has a real graceful
+  # shutdown that SIGKILL throws away: on SIGTERM it disconnects every player with the
+  # SessionDisconnect code SHUTDOWN and flushes its stores (main.ts, server.ts:1327,
+  # gateway/main.ts gives the world processes a moment to do it).
+  #
+  # Both halves of that matter. SHUTDOWN is the one disconnect code the client treats as
+  # TRANSIENT -- net.lua reconnects through it instead of dropping the player into a modal --
+  # so a killed server ejects everyone where a stopped one does not. And an unflushed store
+  # loses whatever was written since the last checkpoint, which on this project means
+  # character state, and we have spent enough of today on characters that lost their stats.
+  #
+  # 20s is well past the flush and short enough that a wedged process does not stall a deploy;
+  # docker escalates to SIGKILL by itself after it.
+  docker stop --time 20 $NAME >/dev/null 2>&1 || true
   docker rm -f $NAME >/dev/null 2>&1 || true
   # Run as whoever owns the staged data dir. config.toml and s3.env are mode 600, so a
   # container whose user does not match cannot read them and dies at loadConfig(). The

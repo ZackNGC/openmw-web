@@ -168,6 +168,17 @@ local jumpQueued = false
 local prevJumpCtl = false
 local lastCellKey = nil
 local lastPoseMirror = 0
+-- Every GUI mode that can pay an NPC out of its purse. Verified against the engine rather
+-- than guessed: these are exactly the call sites of setGoldPool that a player can reach --
+-- tradewindow, trainingwindow, travelwindow, spellbuyingwindow, spellcreationdialog,
+-- enchanting and merchantrepair. Barter alone was covered for a while, which left the other
+-- six paying into a per-client purse that never empties.
+local GOLD_SERVICE_MODES = {
+    Barter = true, Training = true, Travel = true, SpellBuying = true,
+    SpellCreation = true, Enchanting = true, MerchantRepair = true,
+}
+
+local barterTarget = nil -- harness 'barter:open': the NPC whose purse is mirrored
 local walkCmd = nil -- harness 'walk:<dx>,<dy>,<ms>' injection
 local pendingTestEquip = nil -- harness 'equip:<id>:<slot>': equip once the grant lands
 
@@ -187,6 +198,12 @@ local function poseFlags()
     local stance = types.Actor.getStance(self)
     if stance == types.Actor.STANCE.Weapon then flags = flags + 16 end -- bit4
     if stance == types.Actor.STANCE.Spell then flags = flags + 32 end -- bit5
+    -- INPUT DIAGNOSTIC. "Player cannot attack" was reported from live play while every combat
+    -- test stayed green, because the harness drives a synthetic Hit event and had no way to
+    -- press a mouse button. Mirroring the stance lets a scenario prove that REAL input reaches
+    -- the engine at all: readying a weapon must change this.
+    mp.testSet('stance', stance == types.Actor.STANCE.Weapon and 'weapon'
+        or (stance == types.Actor.STANCE.Spell and 'spell' or 'nothing'))
     return flags
 end
 
@@ -268,6 +285,19 @@ local function walkTick()
     self.controls.movement = walkCmd.dy
     self.controls.sideMovement = walkCmd.dx
     self.controls.run = walkCmd.run
+end
+
+-- HARNESS ONLY. Mirrors the merchant's purse so a scenario can assert on it. Polled rather
+-- than pushed because the interesting moment is AFTER the server's canonical figure has been
+-- applied back with setBarterGold, which happens on a network handler the scenario cannot see.
+local nextBarterMirror = 0
+local function barterMirrorTick()
+    if not (barterTarget and barterTarget:isValid()) then return end
+    local now = core.getRealTime()
+    if now < nextBarterMirror then return end
+    nextBarterMirror = now + 0.25
+    local okg, g = pcall(function() return types.Actor.getBarterGold(barterTarget) end)
+    if okg and type(g) == 'number' then mp.testSet('barterGold', tostring(math.floor(g))) end
 end
 
 local function testEquipTick()
@@ -416,6 +446,36 @@ local function pollHarness()
         -- enter Interface mode (frees the mouse cursor + suspends game input, no pause); on
         -- close it restores. This is what lets clicking/typing in the HTML panel not also drive
         -- the game behind it.
+        -- HARNESS ONLY. Opens a real barter window on the nearest living NPC so a scenario
+        -- can exercise the SHARED PURSE end to end -- the one fix nothing else can reach,
+        -- because a merchant's gold only moves through a GUI a bot has no other way to open.
+        -- Nearest-NPC rather than a hardcoded id so the scenario does not depend on which
+        -- cell the harness happens to start in.
+        if cmd == 'barter:open' then
+            local best, bestD2 = nil, nil
+            local cell = self.cell
+            if cell then
+                for _, obj in ipairs(cell:getAll()) do
+                    if types.NPC.objectIsInstance(obj) and not types.Player.objectIsInstance(obj) then
+                        local okd, dead = pcall(function() return types.Actor.isDead(obj) end)
+                        if okd and not dead then
+                            local d2 = (obj.position - self.position):length2()
+                            if not bestD2 or d2 < bestD2 then best, bestD2 = obj, d2 end
+                        end
+                    end
+                end
+            end
+            if best then
+                barterTarget = best
+                pcall(function() I.UI.addMode('Barter', { target = best }) end)
+            else
+                mp.testSet('barterGold', 'no-npc') -- say so rather than time out silently
+            end
+        end
+        if cmd == 'barter:close' then
+            pcall(function() I.UI.removeMode('Barter') end)
+        end
+
         local ui_mode = cmd:match('^uimode:(%a+)$')
         if ui_mode == 'on' then I.UI.setMode('Interface', { windows = {} })
         elseif ui_mode == 'off' then I.UI.removeMode('Interface') end
@@ -493,6 +553,22 @@ local function pollHarness()
         local hitRec, hitNdmg = cmd:match('^hitn:(.+):([%d.]+)$')
         if hitRec then
             core.sendGlobalEvent('mpTestHit', { record = hitRec, damage = tonumber(hitNdmg) })
+        end
+        -- UNARMED variant. Morrowind's hand-to-hand damages FATIGUE, not health, and the engine
+        -- fills only one of the two -- so without a way to send this shape no scenario could
+        -- reproduce the server dropping every unarmed swing. Separate command rather than an
+        -- argument on hitn: record ids may contain colons, so the existing pattern cannot take
+        -- another field on the end without becoming ambiguous.
+        local hitFatRec, hitFatDmg = cmd:match('^hitnfat:(.+):([%d.]+)$')
+        if hitFatRec then
+            core.sendGlobalEvent('mpTestHit',
+                { record = hitFatRec, damage = tonumber(hitFatDmg), channel = 'fatigue' })
+        end
+        -- M5: CAST a damaging spell at an NPC (castat:<recordId>:<magnitude>). Distinct from
+        -- hitn: that is the melee path; this one goes through spelleffects.cpp.
+        local castRec, castMag = cmd:match('^castat:(.+):([%d.]+)$')
+        if castRec then
+            core.sendGlobalEvent('mpTestCastAt', { record = castRec, magnitude = tonumber(castMag) })
         end
         local killNpc = cmd:match('^killnpc:(.+)$')
         if killNpc then core.sendGlobalEvent('mpKillNpc', { id = killNpc }) end
@@ -607,6 +683,14 @@ return {
             if key.symbol == 'v' then core.sendGlobalEvent('mpVoice', { op = 'talk', on = false }) end
         end,
         onKeyPress = function(key)
+            -- INPUT DIAGNOSTIC. "Player cannot attack" / "escape must be pressed twice" were
+            -- reported from live play, and s64-real-input shows keys reaching the PAGE and no
+            -- engine action firing. This mirror answers the next question: does the ENGINE
+            -- deliver key events to scripts at all? If it does, input arrives and something
+            -- downstream (control switches, GUI mode) is swallowing it; if it does not, the
+            -- break is between the browser and SDL.
+            mp.testSet('lastKey', tostring(key.symbol or key.code or '?'))
+            mp.testSet('uiMode', tostring(I.UI.getMode() or 'none'))
             if key.symbol == 't' and not I.UI.getMode() then
                 toggleChat()
             elseif key.symbol == 'v' and not I.UI.getMode() then
@@ -617,6 +701,7 @@ return {
             pollHarness()
             walkTick()
             testEquipTick()
+            barterMirrorTick()
             movementTick()
         end,
     },
@@ -626,6 +711,12 @@ return {
         -- granting the inventory and teleporting us to record.position).
         MP_ApplyRecord = function(record)
             identity.applyRecord(record)
+        end,
+        -- Chargen finished on a BRAND NEW character (global.lua watches chargenstate hit -1).
+        -- There is no record to restore for one of these, so this is the only signal that the
+        -- player has stopped being the engine's template and its stats are worth persisting.
+        MP_ChargenDone = function()
+            identity.markBaselineReady()
         end,
         -- Test hook: dynamic record created by global.lua (equiptest) — equip as a helmet.
         MP_TestItem = function(data)
@@ -655,6 +746,16 @@ return {
             -- (PROTOCOL.md §M6: "released on close, cell change, or disconnect").
             if data.oldMode == 'Dialogue' and data.newMode ~= 'Dialogue' then
                 core.sendGlobalEvent('mpDialogueClosed', {})
+            end
+            -- PAID SERVICES. `arg` is the actor the window belongs to (pushGuiMode passes it
+            -- through uiModeChanged for every mode), which is the NPC the server has to
+            -- arbitrate. Barter is the only one that moves STOCK, but all seven pay the NPC
+            -- out of one field -- getBarterGold -- so all seven have to be watched or the
+            -- purse forks per client again through whichever window is not covered.
+            if GOLD_SERVICE_MODES[data.newMode] and data.arg then
+                core.sendGlobalEvent('mpBarterOpen', { merchant = data.arg })
+            elseif GOLD_SERVICE_MODES[data.oldMode] and not GOLD_SERVICE_MODES[data.newMode] then
+                core.sendGlobalEvent('mpBarterClose', {})
             end
         end,
     },

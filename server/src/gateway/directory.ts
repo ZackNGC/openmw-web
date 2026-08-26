@@ -23,7 +23,9 @@ import { connect as netConnect } from 'node:net';
 import { clientIp, CLIENT_IP_HEADER } from '../net/ws';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
 import { log } from '../log';
+import { renderMetrics } from '../metrics';
 import type { WorldSupervisor, WorldMode } from './worlds';
 import type { HttpRoute } from '../net/http';
 import { IpRateLimiter } from '../net/ratelimit';
@@ -37,6 +39,9 @@ export interface DirectoryDeps {
   // running: the directory's EXISTENCE is the proof it is a real world, which is what stops
   // a dialled /w/priv-anything from spawning one.
   worldsDir: string;
+  /** Bearer for GET /metrics. Absent/empty leaves the route indistinguishable from any other
+   *  unknown path, exactly as the world server's does. */
+  metricsToken?: string;
   // F3 front door: SSO (/auth/*) and locker (/locker/*). Tried before the /worlds routes so the
   // browser has a single public endpoint for sign-in, upload, and world selection. Optional so
   // a bare directory (no SSO/locker) still runs.
@@ -46,9 +51,61 @@ export interface DirectoryDeps {
   // under fabricated names until the global maxWorlds cap was gone, while every per-owner
   // limit read as satisfied. Absent = no verifier wired, and world creation is refused.
   resolveAccount?: (authorizationHeader: string) => string | undefined;
+  // True only when the caller presented the platform's own server credential. A WORLD
+  // PROCESS is a trusted component and has no locker session to present, so this is the only
+  // way it can act for a player. Returns false when no credential is configured, so the
+  // absence of a secret closes the door rather than opening it.
+  isTrustedServer?: (authorizationHeader: string) => boolean;
+  // BROWSER HARNESS ONLY, and ABSENT in production rather than present-and-flagged: main.ts
+  // supplies it only when the operator has already opted into harness auth, so the route
+  // below does not exist at all unless that opt-in was made. A locker session is what the
+  // page needs to change world; harness clients sign in with a server credential that grants
+  // none, so every world switch they attempted died at 'no locker session' before reaching
+  // the network -- which made four scenarios permanently unable to test what they assert.
+  mintHarnessSession?: (account: string, password: string) => string | undefined;
   /** Derive the private-world id for one of this account's characters, or undefined when the
    *  character does not exist — a stale tile must be refused, not built a world. */
   privateWorldIdFor?: (accountKey: string, characterId: string) => Promise<string | undefined>;
+}
+
+/** Fold the gateway's metrics together with every world's into one valid exposition.
+ *
+ *  Prometheus rejects a payload that repeats `# HELP`/`# TYPE` for a metric name, and every
+ *  world emits the same names — so the metadata is kept from whoever declares it first and the
+ *  sample lines are simply concatenated. That is safe precisely because metrics.ts stamps
+ *  `world="<id>"` on every series from a spawned world, so same-named samples do not collide.
+ *
+ *  A slow or wedged world must not hang the scrape: each fetch is bounded, and a world that
+ *  does not answer is skipped rather than failing the whole endpoint — a monitoring system that
+ *  goes blind because one world is sick is worse than one reporting the other nine. */
+async function aggregateMetrics(deps: DirectoryDeps, token: string | undefined): Promise<string> {
+  const seenMeta = new Set<string>();
+  const out: string[] = [];
+  const absorb = (text: string): void => {
+    for (const line of text.split('\n')) {
+      if (line === '') continue;
+      if (line.startsWith('# HELP ') || line.startsWith('# TYPE ')) {
+        if (seenMeta.has(line)) continue;
+        seenMeta.add(line);
+      }
+      out.push(line);
+    }
+  };
+  absorb(renderMetrics());
+  const headers = token ? { authorization: `Bearer ${token}` } : undefined;
+  await Promise.all(deps.worlds.list().filter((w) => w.up).map(async (w) => {
+    try {
+      const r = await fetch(`http://127.0.0.1:${w.port}/metrics`, {
+        ...(headers ? { headers } : {}),
+        signal: AbortSignal.timeout(2000),
+      });
+      if (r.ok) absorb(await r.text());
+      else log('warn', 'metrics.world_scrape_status', { id: w.id, status: r.status });
+    } catch (err) {
+      log('warn', 'metrics.world_unreachable', { id: w.id, error: String(err) });
+    }
+  }));
+  return `${out.join('\n')}\n`;
 }
 
 export interface RunningDirectory {
@@ -107,7 +164,51 @@ export async function startDirectory(deps: DirectoryDeps): Promise<RunningDirect
     }
 
     if (req.method === 'GET' && path === '/healthz') {
-      json(res, 200, { ok: true, worlds: deps.worlds.running });
+      const cap = deps.worlds.capacity();
+      // The CEILING travels with the count. A health check reporting "3 worlds" is not
+      // actionable; "3 of 3, bound by memory" is the difference between a healthy platform
+      // and one that is quietly refusing every new player.
+      json(res, 200, {
+        ok: true,
+        worlds: deps.worlds.running,
+        capacity: Number.isFinite(cap.cap) ? cap.cap : null,
+        capacityReason: cap.reason,
+      });
+      return;
+    }
+
+    // Token-gated scrape, same contract as the world server's (net/http.ts): enabled only
+    // when a token is configured, and never CORS-exposed. deploy/Caddyfile does not proxy
+    // /metrics, so this is reachable from inside the container network and nowhere else.
+    if (req.method === 'GET' && path === '/metrics' && deps.metricsToken) {
+      const want = `Bearer ${deps.metricsToken}`;
+      const got = req.headers.authorization ?? '';
+      // Length-independent compare is overkill for a scrape token on a private network, but
+      // a plain === here would be the only credential check in this file that is not.
+      if (got.length !== want.length || !timingSafeEqual(Buffer.from(got), Buffer.from(want))) {
+        res.writeHead(401, { 'content-type': 'text/plain', 'www-authenticate': 'Bearer' });
+        res.end('unauthorized');
+        return;
+      }
+      // The gateway's OWN series, then every world's, folded into one scrape.
+      //
+      // Each world listens on an internal port that nothing publishes (deploy/Caddyfile proxies
+      // only /w, /auth, /locker, /saves, /worlds), so a world's /metrics was unreachable from
+      // outside the container — the per-world `world=` label metrics.ts stamps so carefully had
+      // no way to be seen. One scrape target, every world in it.
+      // Its own IIFE rather than making the whole request handler async: every other branch
+      // here is synchronous, and widening them all to async would change when their errors
+      // surface. A scrape that throws still answers, with the gateway's own series — going
+      // silent is the one outcome a monitoring endpoint must not have.
+      void aggregateMetrics(deps, deps.metricsToken).then((body) => {
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
+        res.end(body);
+      }).catch((err) => {
+        log('error', 'metrics.aggregate_failed', { error: String(err) });
+        if (res.headersSent) { res.end(); return; }
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
+        res.end(renderMetrics());
+      });
       return;
     }
 
@@ -127,6 +228,21 @@ export async function startDirectory(deps: DirectoryDeps): Promise<RunningDirect
       const w = deps.worlds.get(id);
       if (!w) { json(res, 404, { error: 'no such world' }); return; }
       json(res, 200, pub(w));
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/harness/session' && deps.mintHarnessSession) {
+      let body = '';
+      req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
+      req.on('end', () => {
+        let parsed: { account?: unknown; password?: unknown } = {};
+        try { parsed = JSON.parse(body || '{}'); } catch { json(res, 400, { error: 'bad json' }); return; }
+        const account = typeof parsed.account === 'string' ? parsed.account : '';
+        const password = typeof parsed.password === 'string' ? parsed.password : '';
+        const token = account ? deps.mintHarnessSession!(account, password) : undefined;
+        if (!token) { json(res, 401, { error: 'harness sessions are not available here' }); return; }
+        json(res, 200, { token });
+      });
       return;
     }
 
@@ -150,7 +266,17 @@ export async function startDirectory(deps: DirectoryDeps): Promise<RunningDirect
         // made the per-owner cap decorative: fabricate a new name per request and one caller
         // exhausts every world slot on the host, each holding its slot for the full startup
         // grace, locking real players out with 503s.
-        const account = deps.resolveAccount?.(req.headers.authorization ?? '');
+        // A trusted world process may name the account it is acting for; ANY OTHER CALLER
+        // may not, and is identified by its own session. The distinction is the whole point:
+        // a client-supplied account made the per-owner cap decorative, because one caller
+        // could fabricate a name per request and exhaust every world slot on the host. A
+        // world server cannot present a locker session, so without this it could never
+        // create a world for anyone -- which is exactly what was happening (401 on every
+        // in-game create).
+        const auth = req.headers.authorization ?? '';
+        const account = deps.isTrustedServer?.(auth)
+          ? (typeof parsed.account === 'string' ? parsed.account : undefined)
+          : deps.resolveAccount?.(auth);
         if (!account) { json(res, 401, { error: 'sign_in_first' }); return; }
         let id = parsed.id && /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(parsed.id) ? parsed.id : undefined;
         // A PRIVATE WORLD IS MADE FOR A CHARACTER, so its id is DERIVED, never trusted from

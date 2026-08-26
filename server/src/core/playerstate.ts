@@ -13,7 +13,14 @@ import { log } from '../log';
 import { metrics } from '../metrics';
 
 const MAX_RECORD_ID = 64;
-const MAX_INVENTORY = 512;
+// A DoS BOUND, NOT A GAMEPLAY BOUND -- and the difference is the whole point. This was 512
+// distinct stacks, which a hoarder reaches in a long session, and going one over does not trim
+// the excess: handleInventory returns false and the ENTIRE inventory stops persisting. The
+// player then loses everything acquired since, on every relog, and the only trace is a generic
+// state.invalid_body that does not mention size. Morrowind has roughly two thousand item
+// records in total, so 4096 is beyond any legitimate personal inventory while still bounding
+// what one client can make the server hold.
+const MAX_INVENTORY = 4096;
 const MAX_COUNT = 10000;
 const MAX_SPELLS = 1024;
 const MAX_STAT_ENTRIES = 64;
@@ -59,6 +66,11 @@ function handleAppearance(ctx: StateCtx, player: Player, body: LTable): boolean 
     class: recordId(body.get('class')) ?? '',
     name: recordId(body.get('name')) ?? '',
     isMale: body.get('isMale') === true,
+    // OPTIONAL like hair, and for a stronger reason: a character legitimately may have no
+    // birthsign, and requiring one would reject that character's appearance entirely — which
+    // withholds playerRecord on every join and costs them their inventory and position.
+    ...(recordId(body.get('birthsign')) ? { birthsign: recordId(body.get('birthsign'))! } : {}),
+    ...(body.get('isWerewolf') === true ? { isWerewolf: true } : {}),
   };
   // hair is OPTIONAL: bald/hairless heads are legal in the game data, and demanding it would
   // permanently reject those characters' appearance. The rest identify the character and are
@@ -227,7 +239,16 @@ function noteGain(ctx: StateCtx, player: Player, kind: string, detail: Record<st
 
 function handleInventory(ctx: StateCtx, player: Player, body: LTable): boolean {
   const items = tbl(body.get('items'));
-  if (!items || items.size > MAX_INVENTORY) return false;
+  if (!items) return false;
+  if (items.size > MAX_INVENTORY) {
+    // Say WHICH limit and by how much. Refusing the whole inventory is a silent, permanent
+    // loss for that character, so it must never be indistinguishable from a malformed body.
+    log('error', 'state.inventory_too_large', {
+      from: player.name, size: items.size, cap: MAX_INVENTORY,
+      note: 'inventory NOT persisted; this character loses items on relog until it shrinks',
+    });
+    return false;
+  }
   const out: { id: string; n: number }[] = [];
   for (const [, entry] of items) {
     const t = tbl(entry);
@@ -255,7 +276,62 @@ function handleInventory(ctx: StateCtx, player: Player, body: LTable): boolean {
     noteGain(ctx, player, 'inventory_breadth', { newItems: newIds, total: out.length });
     return false;
   }
-  ctx.store.update(player.charId, (doc) => (doc.inventory = out));
+  // PER-ITEM STATE, carried alongside rather than folded into the counts. `out` keeps its exact
+  // shape because the client's restore grants the SHORTFALL between it and countOf(); changing
+  // how entries aggregate would make that subtraction duplicate or destroy real items. States
+  // are keyed by record id and positional within it, and are advisory: a bad state costs
+  // fidelity, never an item. Bounded by the same entry cap so it cannot grow unchecked.
+  const rawStates = tbl(body.get('itemStates'));
+  const states: Record<string, { condition?: number; charge?: number; soul?: string }[]> = {};
+  if (rawStates) {
+    for (const [k, v] of rawStates) {
+      const id = typeof k === 'string' ? recordId(k) : undefined;
+      const list = tbl(v);
+      if (!id || !list) continue;
+      const bucket: { condition?: number; charge?: number; soul?: string }[] = [];
+      for (const [, e] of list) {
+        const t = tbl(e);
+        if (!t) continue;
+        const cond = finite(t.get('condition'));
+        const charge = finite(t.get('charge'));
+        const soul = recordId(t.get('soul'));
+        const one: { condition?: number; charge?: number; soul?: string } = {};
+        if (cond !== undefined && cond >= 0) one.condition = cond;
+        if (charge !== undefined && charge >= 0) one.charge = charge;
+        if (soul) one.soul = soul;
+        if (Object.keys(one).length > 0) bucket.push(one);
+        if (bucket.length >= MAX_COUNT) break;
+      }
+      if (bucket.length > 0) states[id] = bucket;
+      if (Object.keys(states).length >= MAX_INVENTORY) break;
+    }
+  }
+  ctx.store.update(player.charId, (doc) => {
+    doc.inventory = out;
+    if (Object.keys(states).length > 0) doc.itemStates = states;
+    else delete doc.itemStates;
+  });
+  // The snapshot now accounts for everything credited since the last one, so the credit is
+  // spent. Clearing here (rather than expiring on a timer) is what keeps the ledger from
+  // double-counting: credit and snapshot are the same items seen twice.
+  player.pendingAcquired?.clear();
+  return true;
+}
+
+// A single acquisition, reported the moment it happens. Deliberately additive and unvalidated
+// against any "could you have got this?" rule: it is not a claim of ownership, it is a claim of
+// TIMING — "the snapshot you have is stale by this much". Over-reporting therefore buys a
+// cheater nothing that declaring a fat PlayerInventory would not already buy them, and that path
+// is guarded separately (IMPLAUSIBLE_STACK / IMPLAUSIBLE_DISTINCT above).
+function handleItemAcquired(ctx: StateCtx, player: Player, body: LTable): boolean {
+  const id = recordId(body.get('id'));
+  const n = finite(body.get('n'));
+  if (!id || n === undefined || !Number.isInteger(n) || n < 1 || n > MAX_COUNT) return false;
+  const led = (player.pendingAcquired ??= new Map<string, number>());
+  // Bounded by the same breadth limit the snapshot uses, so a client cannot grow this map
+  // without bound between snapshots.
+  if (!led.has(id) && led.size >= MAX_INVENTORY) return false;
+  led.set(id, Math.min(MAX_COUNT, (led.get(id) ?? 0) + n));
   return true;
 }
 
@@ -272,6 +348,7 @@ const HANDLERS: Record<string, (ctx: StateCtx, player: Player, body: LTable) => 
   PlayerLevel: handleLevel,
   PlayerSpellbook: handleSpellbook,
   PlayerInventory: handleInventory,
+  PlayerItemAcquired: handleItemAcquired,
 };
 
 export function handleStateEvent(ctx: StateCtx, player: Player, name: string, value: LValue | undefined): boolean {

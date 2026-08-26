@@ -112,6 +112,62 @@ test('a clean pack verifies and stays; a pack with a foreign file is deleted', a
   assert.ok(!objects.has(`gamedata/alice/${MEDIA_PACK}`), 'and the object is deleted');
 });
 
+// The wizard cannot know which loose media THIS server recognizes, and guessing wrong is
+// expensive: verifyMediaPack deletes the whole pack over one unknown path. Two genuine retail
+// installs differ in what is loose vs inside a BSA — a real copy carrying Sound/Cr/alamlexia/
+// lost a 166 MB upload to exactly that, then was asked for the voices again on every launch.
+// packableMedia is what lets the client leave those out; the strict gate above is unchanged.
+test('packableMedia lists the packable paths so the wizard can filter its pack', () => {
+  const locker = boot(new Map(), [VOICE, VOICE2, MUSIC]);
+  const packable = locker.packableMedia();
+
+  assert.deepEqual(
+    [...packable].sort(),
+    [VOICE.name.toLowerCase(), VOICE2.name.toLowerCase()].sort(),
+    'voice only — lowercased, and never the per-file media',
+  );
+  assert.ok(!packable.includes(MUSIC.name.toLowerCase()), 'Music/ uploads per file, not in the pack');
+
+  // The point of the list: a client filtering on it drops the entry that would have cost it
+  // the whole pack, and what remains is exactly what verification accepts.
+  const onDisk = [VOICE.name, VOICE2.name, 'Sound/Cr/alamlexia/alamATT01.wav'];
+  const kept = onDisk.filter((p) => packable.includes(p.toLowerCase()));
+  assert.deepEqual(kept, [VOICE.name, VOICE2.name], 'the unknown creature sound is left behind');
+
+  // No hashes ride along: requiredManifest withholds them and this must not leak them.
+  assert.ok(packable.every((p) => typeof p === 'string' && !/[0-9a-f]{64}/.test(p)), 'names only');
+});
+
+// The rejection happens after recordUploaded already said ok:true, so without a stored verdict
+// the browser cannot tell "you never uploaded voices" from "your voices were thrown away".
+test('the media pack verdict survives for the client to explain itself with', async () => {
+  const objects = new Map<string, Buffer>();
+  const locker = boot(objects, [VOICE, VOICE2]);
+  await locker.attest('carol', [], '127.0.0.1');
+  assert.equal(locker.mediaStatusOf('carol'), undefined, 'no verdict before any upload');
+
+  const good = tarOf([VOICE, VOICE2]);
+  objects.set(`gamedata/carol/${MEDIA_PACK}`, good);
+  await locker.recordUploaded('carol', { name: MEDIA_PACK, size: good.length, sha256: sha(good) });
+  await locker.verifyMediaPack('carol');
+  assert.equal(locker.mediaStatusOf('carol')?.reason, 'ok', 'a clean pack records success');
+
+  // The real-world failure: a genuine retail copy carrying media this server has no record of.
+  const foreign = 'Sound/Cr/alamlexia/alamATT01.wav';
+  const bad = tarOf([VOICE, { name: foreign, data: Buffer.from('RIFFnotours') }]);
+  objects.set(`gamedata/carol/${MEDIA_PACK}`, bad);
+  await locker.recordUploaded('carol', { name: MEDIA_PACK, size: bad.length, sha256: sha(bad) });
+  await locker.verifyMediaPack('carol');
+
+  const verdict = locker.mediaStatusOf('carol');
+  assert.equal(verdict?.reason, 'unknown_entry', 'the reason is kept');
+  assert.equal(verdict?.detail, foreign, 'and names the file that did it');
+
+  // Erasure takes the verdict too — it is a record about a person like any other.
+  await locker.erase('carol');
+  assert.equal(locker.mediaStatusOf('carol'), undefined, 'erase leaves nothing behind');
+});
+
 test('an oversized pack is refused up front; not-a-tar is refused at confirm', async () => {
   const objects = new Map<string, Buffer>();
   const locker = boot(objects, [VOICE]);

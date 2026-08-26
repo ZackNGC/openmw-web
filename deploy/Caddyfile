@@ -44,8 +44,22 @@
 	# thing that should re-fetch. (Cloudflare's Cache Rule mirrors this at the edge.)
 	@immutable path *.wasm *.data *.js *.br *.bsa *.esm *.tar
 	header @immutable Cache-Control "public, max-age=31536000, immutable"
-	@html path *.html
+	# "/" MUST be in this matcher. The rewrite above serves launcher.html for the bare root, but
+	# this matcher tests the REQUEST path, which is still "/" — so the root shipped with no
+	# Cache-Control at all while /launcher.html got no-cache. Absent Cache-Control (and with a
+	# Last-Modified present) browsers apply HEURISTIC freshness, ~10% of the document's age, so
+	# returning visitors to morrowind.virtastic.app were served a stale launcher for hours after
+	# a deploy without ever revalidating. That is the bare domain every link points at, so a
+	# deploy was effectively invisible to exactly the people most likely to come back.
+	@html path / *.html
 	header @html Cache-Control "no-cache"
+
+	# Crawler + social files. Without a rule these fall through with NO Cache-Control at all, so
+	# browsers and the edge apply heuristic freshness off Last-Modified — the same trap the @html
+	# comment above describes, and the last thing you want holding a stale robots.txt. An hour is
+	# long enough that a scraper re-fetching og.png is cheap, short enough to correct quickly.
+	@crawl path /robots.txt /sitemap.xml /og.png
+	header @crawl Cache-Control "public, max-age=3600"
 
 	# --- Multiplayer gateway, on THIS origin -------------------------------------------------
 	# The game and the gateway are one origin on purpose. index.html only hands its session

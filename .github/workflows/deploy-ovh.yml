@@ -24,8 +24,7 @@ jobs:
     if: github.repository == 'Virtastic/openmw-web' && github.event_name != 'pull_request'
     runs-on: [self-hosted, ovh, virtastic]
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Stage the gitignored ?nomw demo data (fsroot/gamedata) from the box's canonical source tree
       # into the build context — a clean checkout omits it, and the Dockerfile now FAILS LOUD rather
       # than baking an empty demo. ~/morrowind-src is the rsync'd source of truth on this runner.
@@ -141,6 +140,27 @@ jobs:
           # launcher gate: bare / and ?nomw both reachable (200)
           E -f -o /dev/null https://morrowind.virtastic.app/
           E -f -o /dev/null "https://morrowind.virtastic.app/index.html?nomw"
+
+          # Indexable posture. Google once indexed /index.html?nomw= as its own result, titled with
+          # the engine's "Engine failed to load" overlay -- a crawler cannot run wasm, so the fatal
+          # path is all it can render. The canonical is what folds every boot URL back into "/", so
+          # losing it silently re-creates that failure. Both pages must carry it, and it must point
+          # at the bare root, not at itself.
+          E -o /tmp/root https://morrowind.virtastic.app/
+          for f in /tmp/root /tmp/idx; do
+            grep -q '<link rel="canonical" href="https://morrowind.virtastic.app/">' "$f" || {
+              echo "FATAL: canonical missing/wrong in $f" >&2; exit 1; }
+          done
+          grep -q '<meta name="description"' /tmp/root || {
+            echo "FATAL: no meta description on the launcher" >&2; exit 1; }
+          grep -q 'og:image" content="https://morrowind.virtastic.app/og.png"' /tmp/root || {
+            echo "FATAL: no og:image on the launcher" >&2; exit 1; }
+          # ...and the card it advertises has to exist. A 404 here is invisible until someone
+          # shares the link and gets a bare text card.
+          for u in og.png robots.txt sitemap.xml; do
+            code=$(E -o /dev/null -w '%{http_code}' "https://morrowind.virtastic.app/$u")
+            test "$code" = 200 || { echo "FATAL: /$u returned HTTP $code" >&2; exit 1; }
+          done
           echo "edge health OK"
 
       # Refresh the edge cache for the HTML entry point after a deploy. The engine binaries are now
@@ -164,5 +184,8 @@ jobs:
             -H "Authorization: Bearer ${CF_PURGE_TOKEN}" -H "Content-Type: application/json" \
             --data '{"files":[
               "https://morrowind.virtastic.app/",
-              "https://morrowind.virtastic.app/index.html"
+              "https://morrowind.virtastic.app/index.html",
+              "https://morrowind.virtastic.app/og.png",
+              "https://morrowind.virtastic.app/robots.txt",
+              "https://morrowind.virtastic.app/sitemap.xml"
             ]}'

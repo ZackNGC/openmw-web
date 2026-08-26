@@ -39,6 +39,12 @@ EMSDK_BIN="${EMSDK_BIN:-/opt/homebrew/Cellar/emscripten/6.0.1/libexec}"
 SYSROOT="$EMSDK_BIN/cache/sysroot/lib/wasm32-emscripten"
 LIB="$ROOT/deps/wasm/lib"
 INC="$ROOT/deps/wasm/include"
+# Force-included into every translation unit. These are build INPUTS, so they live in the
+# repo — they used to exist only in the maintainer's gitignored deps/wasm/include, which meant
+# a clean checkout could not compile a single file ("gl_compat.h file not found"). A deps/
+# copy still wins if one is present, so an existing maintainer tree is untouched.
+OMW_FORCE_INC="$ROOT/wasm-build/include"
+[ -f "$INC/gl_compat.h" ] && OMW_FORCE_INC="$INC"
 BUILD="$ROOT/build-wasm"
 
 cd "$BUILD"
@@ -60,6 +66,44 @@ mkdir -p "$MP_DST"
 cp -a "$MP_SRC/." "$MP_DST/"
 cp "$ROOT/openmw/files/data/mp.omwscripts" "$ROOT/fsroot/resources/vfs/mp.omwscripts"
 
+# ICU DATA. The emscripten ICU port links `libicu_stubdata` — ICU's "data supplied elsewhere"
+# placeholder — and ships the actual package under ports/icu without linking it. Nothing was
+# supplying it, so ICU had NO locale data: NumberFormat::createInstance returned null and
+# MessageFormat::format called a virtual on it, which is a bare `RuntimeError: null function`
+# in wasm. The engine died in SettingsWindow's constructor on every single boot.
+#
+# main.cpp points ICU here with u_setDataDirectory("/icu") under __EMSCRIPTEN__; this stages the
+# package it reads. Copied from the emsdk cache rather than committed: it is ~28 MB of upstream
+# build output, and it belongs in the same category as the rest of deps/.
+# Three places it can come from, in order. The emsdk cache is only populated where the ICU
+# port has actually been built, and the prebaked builder image (openmw-builder:1) does NOT
+# carry it -- the data is staged into the source tree instead, which is the convention
+# ci/jenkins/build-engine.sh asserts on and sync-to-builder.sh restages from
+# ~/build-artifacts. Looking only in the cache made this script fail every build on the
+# build server while passing on a laptop with a warm emsdk -- so accept a pre-staged copy
+# and fall back to the cache, rather than the other way round.
+ICU_TARGET="$ROOT/fsroot/icu/icudt68l.dat"
+ICU_STAGED="$ROOT/fsroot/icudt68l.dat"
+ICU_DAT="${EMSDK_BIN}/cache/ports/icu/icu/source/data/in/icudt68l.dat"
+if [ -s "$ICU_TARGET" ]; then
+  echo "   ICU data already staged at fsroot/icu/icudt68l.dat"
+elif [ -s "$ICU_STAGED" ]; then
+  mkdir -p "$ROOT/fsroot/icu"
+  cp "$ICU_STAGED" "$ICU_TARGET"
+  echo "   ICU data staged from fsroot/icudt68l.dat"
+elif [ -f "$ICU_DAT" ]; then
+  mkdir -p "$ROOT/fsroot/icu"
+  cp "$ICU_DAT" "$ICU_TARGET"
+  echo "   ICU data staged from the emsdk ports cache"
+else
+  echo "!! ICU data package not found. Looked in:" >&2
+  echo "     $ICU_TARGET" >&2
+  echo "     $ICU_STAGED" >&2
+  echo "     $ICU_DAT" >&2
+  echo "   The engine will link, boot, and then die with 'null function' in SettingsWindow." >&2
+  exit 1
+fi
+
 # Make sure the objects on the explicit link line are fresh.
 #
 # openmw-lib AND components must be built here, not just main.cpp.o. The link line below
@@ -78,7 +122,7 @@ ninja apps/openmw/CMakeFiles/openmw.dir/main.cpp.o
 "$EMSDK_BIN/em++" \
   -D_LIBCPP_ENABLE_CXX17_REMOVED_FEATURES -DBT_USE_DOUBLE_PRECISION \
   -fwasm-exceptions \
-  -include "$INC/mygui_char_traits_fix.h" -include "$INC/gl_compat.h" \
+  -include "$OMW_FORCE_INC/mygui_char_traits_fix.h" -include "$OMW_FORCE_INC/gl_compat.h" \
   -Wno-missing-template-arg-list-after-template-kw -Wno-error=missing-template-arg-list-after-template-kw \
   -pthread \
   -I"$ROOT/deps/src/bullet3/src" -I"$INC" -I"$ROOT/deps/src/boost_1_85_0" \

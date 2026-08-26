@@ -20,6 +20,9 @@ local SNAPSHOT_SECONDS = 5
 -- idempotent) and must keep running: cell actors stream in after the cell-change event.
 local ATTACH_SWEEP_SECONDS = 1
 local STATS_MIN_INTERVAL = 0.25
+-- Equipment changes far less often than stats and costs more to apply (the puppet has to
+-- create the items), so it is diffed on a slower beat.
+local EQUIP_MIN_INTERVAL = 0.5
 
 local deps = nil -- {playerFn, ownCellKeyFn, ownIdFn, isMpPuppetFn}
 
@@ -141,6 +144,54 @@ local function broadcastCell(cellKey, epoch, cell, now)
                 tracked.nextStats = now + STATS_MIN_INTERVAL
                 mp.sendEvent('ActorStatsDynamic',
                     { cellKey = cellKey, epoch = epoch, ref = obj, hp = dyn.hp, mp = dyn.mp, ft = dyn.ft })
+            end
+        end
+
+        -- EQUIPMENT DIFF. ActorEquip has always been relayed by the server (holder-only,
+        -- epoch-guarded, cell-scoped) and no client ever SENT one, so an NPC that drew a
+        -- weapon, swapped armour or was disarmed looked different on every screen: whatever it
+        -- happened to be wearing when that client first loaded the cell. Record ids travel, not
+        -- objects -- a foreign object id means nothing here, which is the same reason the
+        -- player equipment path sends ids.
+        if not tracked.nextEquip or now >= tracked.nextEquip then
+            local okEq, eq = pcall(function() return types.Actor.getEquipment(obj) end)
+            if okEq and eq then
+                local slots, parts = {}, {}
+                for slot, item in pairs(eq) do
+                    local okr, rid = pcall(function() return item.recordId end)
+                    if okr and rid then
+                        slots[slot] = rid
+                        parts[#parts + 1] = tostring(slot) .. '=' .. rid
+                    end
+                end
+                table.sort(parts)
+                local fp = table.concat(parts, ',')
+                if fp ~= tracked.equipFp then
+                    tracked.equipFp = fp
+                    tracked.nextEquip = now + EQUIP_MIN_INTERVAL
+                    mp.sendEvent('ActorEquip',
+                        { cellKey = cellKey, epoch = epoch, ref = obj, slots = slots })
+                end
+            end
+        end
+
+        -- DISPOSITION. Shared, not personal: getBaseDisposition(npc, player) ignores its player
+        -- argument and reads one value off the NPC's stats, so persuading, bribing or
+        -- threatening someone changes how they feel about EVERYONE. Left unsynced it was
+        -- per-client, so a player could talk a guard down and their friend would still be
+        -- attacked by the same guard. Same slow beat as equipment; it moves rarely.
+        if not tracked.nextDisp or now >= tracked.nextDisp then
+            local ownPlayer = world.players[1]
+            if ownPlayer and ownPlayer:isValid() then
+                local okD, disp = pcall(function()
+                    return types.NPC.getBaseDisposition(obj, ownPlayer)
+                end)
+                if okD and type(disp) == 'number' and disp ~= tracked.dispVal then
+                    tracked.dispVal = disp
+                    tracked.nextDisp = now + EQUIP_MIN_INTERVAL
+                    mp.sendEvent('ActorDisposition',
+                        { cellKey = cellKey, epoch = epoch, ref = obj, disposition = disp })
+                end
             end
         end
 
@@ -303,6 +354,27 @@ actors.handlers.MP_ActorStatsDynamic = function(data)
     local obj = data.ref and data.ref:isValid() and data.ref or nil
     if obj and puppetActors[refKeyOf(obj)] then
         pcall(function() obj:sendEvent('MP_Stats', { hp = data.hp, mp = data.mp, ft = data.ft }) end)
+    end
+end
+
+-- The holder says what this actor is wearing. Handed to the puppet script, which already knows
+-- how to turn record ids into equipped objects and retry until the items exist (puppet.lua
+-- MP_Equip / pendingEquip) -- the same path a remote PLAYER's equipment takes.
+-- The holder says how this NPC now feels. Applied directly rather than through the puppet:
+-- disposition lives on the actor's own stats, and setBaseDisposition is a GLOBAL-context call
+-- (local scripts may only modify themselves), which is the context this handler runs in.
+actors.handlers.MP_ActorDisposition = function(data)
+    local obj = data.ref and data.ref:isValid() and data.ref or nil
+    if not obj or type(data.disposition) ~= 'number' then return end
+    local ownPlayer = world.players[1]
+    if not (ownPlayer and ownPlayer:isValid()) then return end
+    pcall(function() types.NPC.setBaseDisposition(obj, ownPlayer, data.disposition) end)
+end
+
+actors.handlers.MP_ActorEquip = function(data)
+    local obj = data.ref and data.ref:isValid() and data.ref or nil
+    if obj and puppetActors[refKeyOf(obj)] then
+        pcall(function() obj:sendEvent('MP_Equip', { slots = data.slots or {} }) end)
     end
 end
 

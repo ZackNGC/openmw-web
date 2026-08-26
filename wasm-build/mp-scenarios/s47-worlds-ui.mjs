@@ -24,7 +24,12 @@ const GW_PORT = 58400 + (process.pid % 120);
 
 // Point this scenario's world at the gateway below. Without it the Worlds tab correctly
 // reports "standalone" and there is nothing to exercise.
-export const serverRules = `[gateway]\nurl = "http://127.0.0.1:${GW_PORT}"`;
+// serverToken is the credential a WORLD PROCESS presents to the gateway so it may create
+// a world for a player. The gateway takes the account from the caller's identity and never
+// from the body, and a world has no locker session to present -- so without this every
+// in-game create is refused with 401, which is exactly what was happening. This one file is
+// both the world's config and the gateway's --shared config, mirroring production.
+export const serverRules = `[gateway]\nurl = "http://127.0.0.1:${GW_PORT}"\nserverToken = "harness-server-credential-not-for-production"`;
 
 async function waitHttp(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -36,6 +41,36 @@ async function waitHttp(url, timeoutMs) {
     await new Promise((r) => setTimeout(r, 300));
   }
   return false;
+}
+
+
+// The gateway mints these only when harness auth is on; a null here means the affordance is
+// absent, and the scenario says so rather than failing later at 'no locker session'.
+async function harnessSession(gwPort, account) {
+  const r = await fetch(`http://127.0.0.1:${gwPort}/harness/session`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ account, password: 'harness-pass-1' }),
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!r.ok) throw new Error(`the gateway would not mint a harness locker session (${r.status})`);
+  return (await r.json()).token;
+}
+
+// Injected AFTER boot, never through the URL. #mplocker in the address flips index.html into
+// locker/launcher mode -- a different asset path that never comes up in the harness and killed
+// the client outright. These two globals are the whole of what rebootIntoWorld reads, and the
+// base has to point at the GATEWAY: /auth/ticket lives there, while lockerHttpBase would
+// otherwise derive it from the WORLD's socket URL and get a server that does not serve it.
+async function grantLockerSession(client, gwPort, account) {
+  const token = await harnessSession(gwPort, account);
+  // Ends in a STRING on purpose. The last expression is what Runtime.evaluate serialises, and
+  // an assignment whose value is a function comes back as an unserialisable remote object --
+  // which rejects, and an unhandled rejection here takes the whole run down with no output at
+  // all rather than failing this scenario.
+  await client.eval(`window.__omwLockerToken = ${JSON.stringify(token)};`
+    + `window.__lockerHttpBase = function(){ return 'http://127.0.0.1:${gwPort}'; };`
+    + `'granted';`);
 }
 
 export default async function run(ctx) {
@@ -74,9 +109,87 @@ export default async function run(ctx) {
     assert.ok(await waitHttp(`http://127.0.0.1:${gwPort}/healthz`, 30_000), 'the gateway must come up');
     ctx.log(`gateway up on ${gwPort}`);
 
+    // THE SPLICE ITSELF, tested without a browser. /w/<id> on the gateway is how a real client
+    // reaches a world -- Caddy fronts it in production -- and it is what every world SWITCH
+    // resolves to, so if it does not work nothing downstream can. Node rather than the engine
+    // so a failure here is unambiguously the gateway and not the client.
+    // WAIT FOR THE WORLD TO BE UP FIRST. healthz only says the GATEWAY answers; the public
+    // world it supervises is spawned after and reported up only once its status poll
+    // succeeds. Dialling before then is a 502 by design ("a world that is down must fail the
+    // handshake, not hang"), so testing the splice against it measures the race, not the
+    // splice.
+    const upBy0 = Date.now() + 60_000;
+    let publicUp = false;
+    while (Date.now() < upBy0) {
+      try {
+        const l = await (await fetch(`http://127.0.0.1:${gwPort}/worlds`)).json();
+        if ((l.worlds ?? []).find((w) => w.id === 'vvardenfell')?.up) { publicUp = true; break; }
+      } catch { /* not answering yet */ }
+      await ctx.sleep(1000);
+    }
+    assert.ok(publicUp, 'the gateway must bring its public world up');
+
+    const spliced = await new Promise((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${gwPort}/w/vvardenfell`);
+      const done = (v) => { try { ws.close(); } catch { /* already gone */ } resolve(v); };
+      ws.addEventListener('open', () => done('open'), { once: true });
+      ws.addEventListener('error', () => done('error'), { once: true });
+      ws.addEventListener('close', (e) => done(`closed ${e.code}`), { once: true });
+      setTimeout(() => done('timeout'), 10_000);
+    });
+    ctx.log(`  gateway splice /w/vvardenfell: ${spliced}`);
+    assert.equal(spliced, 'open',
+      `the gateway must splice /w/<id> through to a world, got "${spliced}" — a world SWITCH `
+      + 'resolves to exactly this path, so nothing downstream can work without it');
+
+
     // The scenario's world must point at this gateway, or its Worlds tab correctly reports
     // "standalone" and there is nothing to test.
-    const a = await ctx.launchClient('bot-a', '');
+    // A LOCKER SESSION, which ?mpauto=1 does not grant. The page needs one to change world at
+    // all: rebootIntoWorld mints a fresh single-use ticket with it, and without one every
+    // switch died at 'no locker session' before touching the network -- so this scenario was
+    // asserting against a path it could not reach. The gateway only serves this when harness
+    // auth is already enabled, which is exactly where this runs.
+    // THROUGH THE GATEWAY, which is what a real player does and the only way this scenario can
+    // test a switch at all. worldUrlOf builds a switch destination from the CURRENT
+    // connection's authority plus the world's /w/<id> path, so a client dialled straight at a
+    // world derives ws://<that world>/w/<other world> -- a path no world serves, because the
+    // GATEWAY is what splices it through (Caddy fronts it the same way in production).
+    //
+    // This must come AFTER the public world is up. An earlier attempt dialled the gateway
+    // while that world was still booting, got the 502 a down world is supposed to answer with,
+    // and never recovered -- which read as "the gateway upgrade path is broken" and was really
+    // just a race. The splice assertion above proves the path itself works.
+    // ...into the player's OWN world, not the public one. A brand-new account is refused by
+    // public with "finish creating your character in your private world first" -- a real
+    // product rule, not a harness quirk -- so booting straight into public could never work.
+    // This is the production flow: the launcher creates your solo world through the gateway
+    // with your locker session, and you arrive there.
+    const acctName = `bot-a-${ctx.runId}`;
+    const soloToken = await harnessSession(gwPort, acctName);
+    const soloId = 'solo-bot-a';
+    const mk = await fetch(`http://127.0.0.1:${gwPort}/worlds`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${soloToken}` },
+      body: JSON.stringify({ id: soloId, mode: 'private' }),
+    });
+    assert.equal(mk.status, 200, `the player's own world must be creatable (${mk.status})`);
+    const soloUpBy = Date.now() + 60_000;
+    let soloUp = false;
+    while (Date.now() < soloUpBy) {
+      try {
+        const w = await (await fetch(`http://127.0.0.1:${gwPort}/worlds/${soloId}`)).json();
+        if (w.up) { soloUp = true; break; }
+      } catch { /* still booting */ }
+      await ctx.sleep(1000);
+    }
+    assert.ok(soloUp, "the player's own world must come up");
+    ctx.log(`  own world ${soloId} is up`);
+
+    const a = await ctx.launchClient('bot-a', '', {
+      mpUrl: `ws://127.0.0.1:${gwPort}/w/${soloId}`,
+    });
+    await grantLockerSession(a, GW_PORT, `bot-a-${ctx.runId}`);
 
     // --- 1. The tab fetches the directory the first time it is opened ------------------
     await a.eval("Module.__omwMPCmd='socialtab:worlds'");
@@ -94,6 +207,15 @@ export default async function run(ctx) {
     // The harness cannot type into the name field, so the create is driven by a test hook
     // that goes through the same uplink a button press would.
     await a.eval("Module.__omwMPCmd='worldcreate:my-session:private'");
+    // Read the SERVER'S ANSWER before waiting on the list. social.lua mirrors it to
+    // `worldCreate`, and waiting only on worldCount turned every refusal -- platform_full,
+    // too_many_sessions, unreachable -- into the same blind 30s timeout that says nothing
+    // about which one happened.
+    await a.waitFor('((window.__omwMP||{}).worldCreate||"") !== ""', STEP,
+      'the server answered the create request at all');
+    const created = JSON.parse(await a.eval('(window.__omwMP||{}).worldCreate'));
+    ctx.log(`  create answered: ok=${created.ok} error="${created.error ?? ''}"`);
+    assert.equal(created.ok, true, `creating a session was refused: ${created.error || 'no reason given'}`);
     await a.waitFor(`Number((window.__omwMP||{}).worldCount||0) > ${before}`, STEP,
       'the new session appears in the list');
     ctx.log(`  after create: ${await a.eval("(window.__omwMP||{}).worldCount")} worlds`);
@@ -111,7 +233,12 @@ export default async function run(ctx) {
     // The part a player would notice most if it were broken. Pressing join goes through
     // joinWorld() -> MP_JoinWorld -> net.switchTo(): a disconnect and a redial of a
     // DIFFERENT world, with no page reload, so the engine and loaded assets stay put.
-    const sessionPort = listed.worlds.find((w) => w.id === 'my-session').port;
+    // NO PORT. The directory strips a world's internal host and port from everything it
+    // serves -- there is a test asserting it must not leak them, because an address there was
+    // once a configured guess defaulting to 127.0.0.1, i.e. a remote player's own machine.
+    // This used to read `.port` (undefined), poll http://127.0.0.1:undefined/status, and
+    // report the resulting silence as 'the player never arrived'. playerCount survives the
+    // sanitiser, so the gateway's own view is both correct and the only thing available.
 
     // A freshly spawned world takes time to answer /status; the UI only offers a join once
     // it is up, so the test must wait for the same condition rather than racing it.
@@ -129,19 +256,32 @@ export default async function run(ctx) {
     await ctx.sleep(1500);
 
     await a.eval("Module.__omwMPCmd='worldjoin:my-session'");
+    // WHAT THE CLIENT DECIDED. The join is a chain -- MP_SocialJoinById -> joinWorld ->
+    // mpJoinWorld -> net.switchTo -> the page's rebootIntoWorld -- and every link can fail
+    // quietly. These four mirrors say which link stopped: joinError means the world was never
+    // in the client's list, publicStage means switchTo was reached and with what address,
+    // switchTo empty AFTER that means the page took it and gave up, and dialTarget says where
+    // a reconnect would now go.
+    await ctx.sleep(2000);
+    for (const k of ['joinError', 'publicStage', 'switchTo', 'dialTarget']) {
+      ctx.log(`  ${k}: "${String(await a.eval(`(window.__omwMP||{}).${k}||''`))}"`);
+    }
     // The definitive check is on the DESTINATION world: it must report a player that was
     // not there before. Asserting only on client state would pass if the client merely
     // believed it had moved.
     const joinedBy = Date.now() + 60_000;
     let arrived = false;
+    let lastSeen = 'the gateway was never reached';
     while (Date.now() < joinedBy) {
       try {
-        const st = await (await fetch(`http://127.0.0.1:${sessionPort}/status`)).json();
-        if ((st.playerCount ?? 0) > 0) { arrived = true; break; }
-      } catch { /* still switching */ }
+        const w = await (await fetch(`http://127.0.0.1:${gwPort}/worlds/my-session`)).json();
+        lastSeen = `playerCount=${w.playerCount ?? 0} up=${w.up}`;
+        if ((w.playerCount ?? 0) > 0) { arrived = true; break; }
+      } catch (err) { lastSeen = `gateway error: ${err}`; }
       await ctx.sleep(1000);
     }
-    assert.ok(arrived, 'the player must actually arrive in the world they joined');
+    ctx.log(`  destination world: ${lastSeen}`);
+    assert.ok(arrived, `the player must actually arrive in the world they joined — ${lastSeen}`);
     ctx.log('  join: player moved to my-session and the destination world sees them');
     ctx.log(`  after join: ${await a.screenshot(join(SHOTS, '3-joined-session.png'))}`);
 

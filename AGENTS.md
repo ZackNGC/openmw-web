@@ -39,28 +39,85 @@ exists precisely so testing never touches production. Note `mp.virtastic.app` is
 thing: the design that wanted it is dead, and the vhost that kept the name alive has been
 deleted (see "One origin" below).
 
-**DO NOT push local feature branches to `origin`.** `Virtastic/openmw-web` is a **public** repo.
-The `multiplayer` branch is local-only and unpushed. Publishing is the maintainer's decision.
-(There is also a credential in `fsroot/resources/vfs/scripts/mp/net.lua` pending rotation.)
-The build server does not use git — it builds from a synced working tree, so nothing leaves
-the network.
+**`dev` IS THE INTEGRATION BRANCH, AND IT IS PUBLIC.** `Virtastic/openmw-web` is a **public**
+repo, so everything merged to `dev` is published permanently the moment it lands. Read what you
+are pushing. `ci/jenkins/config.env` is gitignored and must stay that way — it holds this
+network's hosts and key paths.
+
+`dev` is branch-protected: **one approving review**, stale reviews dismissed, no force-push and
+no deletion. Admins are not forced through it (`enforce_admins` is off), so the maintainer keeps
+a direct push for emergencies — use it as one.
+
+**Contributors open a PR against `dev`.** The maintainer approves and merges. `main` and
+`ovhcloud` are NOT touched by this flow: `ovhcloud` deploys production and is a separate,
+deliberate promotion.
 
 ---
 
 ## The loop
 
-The build server holds a mirror of the working tree at `~/morrowind-src` on `jenkins-vm`.
-Sync local changes to it, then trigger a build.
+**Merge to `dev`, then run one command.** Builds happen when somebody asks for one -- there is
+no polling and no webhook, because triggering Jenkins needs a credential this setup does not
+hand out (`/git/notifyCommit` answers 401 and the remote build URL 403 with anonymous read
+disabled). Asking is a single command, and it runs everything ON THE BUILD SERVER:
 
 ```bash
-# 1. push your working tree to the build server (from the repo root)
-./ci/jenkins/sync-to-builder.sh
-
-# 2. build + deploy to the test server
-#    Jenkins UI:  http://<build server>:8080/   (BUILDER in ci/jenkins/config.env)
-#      OpenMW-Web-MP-Server     ~1 min    gateway + sim peer, then deploy
-#      OpenMW-Web-Engine-WASM   ~13 min   WASM engine: full compile, then deploy
+ci/jenkins/release-to-test.sh            # both images
+ci/jenkins/release-to-test.sh engine     # just the WASM engine  (~13 min)
+ci/jenkins/release-to-test.sh server     # just the gateway + sim peer
 ```
+
+It fetches `origin/dev`, restages the build inputs git cannot carry, builds, and deploys --
+stopping at the first failure. The deploy runs the contract gate and fails on any miss.
+
+**CLIENT LUA IS BAKED INTO THE ENGINE.** `fsroot/resources/vfs/scripts/mp/*.lua` is packed into
+`openmw.data`, so the browser scenario suite runs whatever was in the engine at BUILD time, not
+what is on disk. Editing a client script and re-running `mp-harness.mjs` tests the OLD code and
+passes, which is worse than not running it. Rebuild the engine (~13 min) before believing a
+scenario result about a client-side change. Cheap check:
+
+```bash
+grep -c <your-new-symbol> play/openmw.data    # 0 means the harness cannot see your change
+```
+
+**RUN IT SO IT OUTLIVES ITS CALLER.** It drives the build server over a single ssh session, so if
+the local process dies the ssh dies with it and the remote run stops WHEREVER IT HAD GOT TO. That
+is not a visible failure: a run killed between the two deploys shipped the server and not the
+engine, every line it had printed said success, and the site kept serving the previous client
+while the server ran new code. Nothing in the logs says so -- the tell is the engine hash in
+`/index.html` not moving, and the container's age not resetting. Foreground it, or use a job
+runner that keeps it alive; `nohup cmd &` from a shell that then exits is exactly the trap.
+
+Confirm a deploy by what CHANGED, never by the exit code:
+
+```bash
+curl -sk https://<origin>/index.html | grep -o '__ENGINE_VER = "[^"]*"'   # must differ
+ssh <test-host> 'docker ps --format "{{.Names}} {{.RunningFor}}"'         # must have reset
+```
+
+| Job | Time | What it does |
+|---|---|---|
+| server | ~1 min, longer if `openmw/` changed | gateway + sim peer -> deploy -> contract gate |
+| engine | ~13 min | WASM engine + statics -> deploy -> contract gate |
+
+Nothing compiles on the laptop. A clean engine build is ~13 minutes and will lock that machine
+up; `release-to-test.sh` only ever drives the build server over ssh.
+
+**Jenkins holds the same two jobs**, defined by `ci/jenkins/Jenkinsfile.engine` and
+`.server` in this repo, and runs the identical scripts. Use *Build Now* from its UI if you
+prefer a button and a build history. It is deliberately not scheduled.
+
+**The build inputs are not in git.** `deps/`, `fsroot/gamedata/` and `fsroot/icudt68l.dat` are
+~750 MB of retail data and prebuilt dependencies, deliberately unpublished, so a checkout alone
+is NOT a buildable tree -- `build-engine.sh` hard-fails on all three.
+`ci/jenkins/restage-inputs.sh` puts them back from `~/build-artifacts` when missing; normally a
+no-op, since `git checkout -f` leaves untracked files alone.
+
+**`sync-to-builder.sh` is retired.** It rsynced the laptop's tree including
+`ci/jenkins/config.env` -- which is how the deploy stage silently broke: that file carries
+laptop-shaped `TEST_HOST`/`SSH_KEY` values that cannot resolve inside the Jenkins container, so
+deploys failed there while working by hand, and nobody saw a red build because the job simply
+stopped being used. Commit your work and push it instead.
 
 After a deploy the test server serves:
 

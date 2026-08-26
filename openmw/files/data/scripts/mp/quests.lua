@@ -54,6 +54,17 @@ local pendingApply = {} -- inbound entries that arrived before the player object
 local globals = {} -- name -> last seen value
 local globalSeq = {} -- name -> last sequence WE stamped
 local globalsSeeded = false
+-- FIFO queue of globals waiting to be sent, plus a membership set so a variable that changes
+-- again while queued keeps its ORIGINAL place rather than going to the back forever.
+--
+-- Without this the send order was pairs(store), which Lua explicitly does not define, capped at
+-- MAX_GLOBALS_PER_TICK. Above that many churning globals -- and Morrowind has scripts that set
+-- values every other frame -- WHICH ones got through was arbitrary each tick, so a quest global
+-- could sit unsent indefinitely behind them while the log showed a healthy, rate-limited sync.
+-- TES3MP hit the same class and solved it with a whitelist; a queue fixes the fairness without
+-- needing to enumerate every global in the game.
+local globalQueue = {} -- array of names, oldest first
+local globalQueued = {} -- name -> true while it is in globalQueue
 
 local factions = {} -- factionId -> fingerprint string
 local factionsSeeded = false
@@ -124,8 +135,19 @@ local function applyJournalEntry(questId, index)
         -- not every stage passed through). The index still has to land.
         print('[mp] journal: no entry text for "' .. tostring(questId) .. '" @' .. tostring(index))
     end
-    quest.stage = index -- belt and braces: never assume addEntry left the index where we want
+    -- PROTECTED, AND `applying` RESET WHATEVER HAPPENS. This assignment used to sit outside any
+    -- pcall between `applying = true` and `applying = false`, so one throw here left the flag
+    -- stuck true for the rest of the session -- and onQuestUpdate early-returns on `applying`,
+    -- which means the client would silently stop reporting ANY local quest progress from that
+    -- moment on. No error, no recovery, and the player's quests simply stop travelling.
+    -- belt and braces: never assume addEntry left the index where we want it.
+    local okStage, stageErr = pcall(function() quest.stage = index end)
     applying = false
+    if not okStage then
+        print('[mp] journal: could not set stage for "' .. tostring(questId) .. '" @'
+            .. tostring(index) .. ': ' .. tostring(stageErr))
+        return false
+    end
     return true
 end
 
@@ -152,21 +174,37 @@ end
 
 local function diffGlobals()
     local store = globalStore()
-    local sent = 0
+    -- 1. Notice every change and ENQUEUE it. Detection is not rate limited; only sending is,
+    --    so a change can never be missed just because the tick's budget was already spent.
     for name, value in pairs(store) do
         if not TIME_GLOBALS[string.lower(name)] then
             if globals[name] ~= value then
                 globals[name] = value
-                if globalsSeeded and sent < MAX_GLOBALS_PER_TICK then
-                    local seq = (globalSeq[name] or 0) + 1
-                    globalSeq[name] = seq
-                    mp.sendEvent('GlobalVarUpdate', { name = name, value = value, seq = seq })
-                    sent = sent + 1
+                if globalsSeeded and not globalQueued[name] then
+                    globalQueued[name] = true
+                    globalQueue[#globalQueue + 1] = name
                 end
             end
         end
     end
     globalsSeeded = true
+
+    -- 2. Drain the FRONT of the queue. Oldest waiting first, so nothing starves however many
+    --    other globals are churning. The value sent is the CURRENT one, not the one that was
+    --    current when it was queued -- the receiver wants where the variable ended up.
+    local sent = 0
+    while sent < MAX_GLOBALS_PER_TICK and #globalQueue > 0 do
+        local name = table.remove(globalQueue, 1)
+        globalQueued[name] = nil
+        local value = store[name]
+        if value ~= nil then
+            local seq = (globalSeq[name] or 0) + 1
+            globalSeq[name] = seq
+            mp.sendEvent('GlobalVarUpdate', { name = name, value = value, seq = seq })
+            sent = sent + 1
+        end
+    end
+    if #globalQueue > 0 then mp.testSet('globalBacklog', tostring(#globalQueue)) end
 end
 
 -- ================================================================== factions / crime
@@ -331,12 +369,19 @@ handlers.MP_JournalSync = function(data)
             if not types.Player.isJournalStashed(player) then
                 types.Player.stashJournal(player)
                 print('[mp] journal: stashed own campaign for a visit')
+                -- SAY IT. A guest whose journal silently becomes someone else's reads it as
+                -- lost progress, and a guest who does not realise the quests they are
+                -- advancing are the HOST's is being quietly misled about what their evening
+                -- earned them. Both are answered by one line at the moment it happens.
+                notice("You are visiting this world's campaign — quests here advance the host's"
+                    .. ' journal. Your own is set aside and comes back when you go home.')
             end
         elseif types.Player.isJournalStashed(player) then
             -- Home. The borrowed set is discarded and ours moves back as the same objects,
             -- so the restore is exact rather than a reconstruction.
             types.Player.unstashJournal(player)
             print('[mp] journal: restored own campaign')
+            notice('Your own journal is back.')
         end
     end
     for questId, index in pairs(data.quests or {}) do

@@ -13,18 +13,49 @@ services:
       # All persistent state (accounts, players, world, config.toml overrides, logs).
       # The deploy workflow never touches this dir's contents.
       - /opt/openmw-mp/data:/data
-      # Tier 2 (optional): the operator's OWN game data, read-only. An empty or absent
-      # dir is tier 1 — full multiplayer, NPCs simulated by player clients. With valid
-      # data AND the tier2 image (openmw-mp:tier2, built from Dockerfile.simpeer) the
-      # server runs a headless sim peer per world. Game data is bring-your-own and is
-      # never bundled or deployed by any workflow.
+      # The operator's OWN game data, read-only. REQUIRED since 1.1.0: every world runs
+      # a headless sim peer and the server refuses to boot without usable game data here.
+      # Game data is bring-your-own and is never bundled or deployed by any workflow.
       - /opt/openmw-mp/gamedata:/data/gamedata:ro
     environment:
       - NODE_ENV=production
-    # Sized for tier 2: node server (heap-capped at 256 MB) + one headless sim peer
-    # (~310 MB measured with retail data) + slack. A tier 1 deploy (alpine image, no
-    # peer) fits the old 384m; a runaway leak still trips well before the box cares.
-    mem_limit: 1536m
+    # journald instead of the default json-file: json-file logs are DELETED when a deploy
+    # recreates the container, destroying the evidence of whatever bug the deploy fixes.
+    # journald persists across recreations (query history: `journalctl CONTAINER_NAME=openmw-mp`),
+    # rotates itself, and `docker logs openmw-mp` still works. Host journald storage is
+    # persistent on the VPS (/var/log/journal exists).
+    logging:
+      driver: journald
+      options:
+        tag: openmw-mp
+    # S3/locker credentials (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY — see
+    # docs/PRODUCTION-BRINGUP.md §3). Lives under data/ because the deploy workflow never
+    # touches that dir, same convention as the test server's /opt/openmw-mp-test/data/s3.env.
+    # Optional so a fresh box still boots (the server then logs locker.s3_creds_missing at
+    # error level and deploy-mp fails its gate — absent keys must never be silent again).
+    env_file:
+      - path: /opt/openmw-mp/data/s3.env
+        required: false
+    # Sized for gateway + worlds + sim peers. The old value was 1536m, described as room for
+    # "one headless sim peer" — which was the whole problem: EVERY occupied world runs its own
+    # peer (each world process has its own SimPeerSupervisor), so the real cost is ~780 MB per
+    # occupied world (node ~330 MB + peer ~450 MB). At 1536m the box fits ONE world, while the
+    # gateway's own cap was derived from maxPlayers and would happily spawn 256 — so the
+    # governor was a count that could not see the thing that runs out, and the OOM killer took
+    # the container instead of anyone being told the platform was full.
+    #
+    # 8g targets the "tens of concurrent players" shape. At the MEASURED 623 MB per occupied
+    # world (sim peer 487 MB + world process 136 MB, retail data, host load 1.4) that is 12
+    # concurrent worlds after the gateway's own reserve.
+    #
+    # This MUST stay >= [worlds] memBudgetMb + gatewayReserveMb in config.toml, which is what
+    # actually refuses a world before the kernel does. Raising one without the other just moves
+    # which of the two kills you.
+    #
+    # Re-measure on the deploy target before trusting these: the figures above are from an
+    # x86-64 Linux container with one player in one exterior cell, and a peer anchoring several
+    # busy cells will cost more. server/scripts/measure-capacity.ts does it.
+    mem_limit: 8g
     # SIGTERM triggers a full persistence flush; give it time before SIGKILL.
     stop_grace_period: 30s
 networks:

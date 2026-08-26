@@ -1,5 +1,24 @@
-<!doctype html><html><head><!-- Copyright (C) 2025-2026 Virtastic - https://virtastic.app | SPDX-License-Identifier: GPL-3.0-or-later | part of openmw-web --><meta charset="utf-8"><title>OpenMW-Web</title><script>/* Lock the tab title: the engine calls SDL_SetWindowTitle (document.title=...) on boot; shadow the property so those writes are ignored and the tab always reads OpenMW-Web. */(function(){var LOCK="OpenMW-Web";try{Object.defineProperty(document,"title",{configurable:true,get:function(){return LOCK},set:function(){}});}catch(e){}try{var t=document.getElementsByTagName("title")[0];if(t)t.textContent=LOCK;}catch(e){}})();</script>
+<!doctype html><html lang="en"><head><!-- Copyright (C) 2025-2026 Virtastic - https://virtastic.app | SPDX-License-Identifier: GPL-3.0-or-later | part of openmw-web --><meta charset="utf-8"><title>OpenMW-Web</title><script>/* Lock the tab title: the engine calls SDL_SetWindowTitle (document.title=...) on boot; shadow the property so those writes are ignored and the tab always reads OpenMW-Web. */(function(){var LOCK="OpenMW-Web";try{Object.defineProperty(document,"title",{configurable:true,get:function(){return LOCK},set:function(){}});}catch(e){}try{var t=document.getElementsByTagName("title")[0];if(t)t.textContent=LOCK;}catch(e){}})();</script>
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<!-- SEO. This page IS the game (see deploy/Caddyfile: "/index.html means the GAME"), so it is
+     a real destination for a player - but never a distinct search result. A crawler cannot run
+     the engine, so all it can render here is the fatalOverlay, which is exactly how
+     /index.html?nomw= came to be indexed under the title "Engine failed to load". The canonical
+     folds this page and every boot query into the launcher at the bare root. -->
+<meta name="description" content="Play Morrowind in your browser - the OpenMW engine compiled to WebAssembly. Free sample world, bring your own copy, or multiplayer. Desktop Chrome/Chromium.">
+<link rel="canonical" href="https://morrowind.virtastic.app/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Virtastic">
+<meta property="og:title" content="Morrowind in your browser">
+<meta property="og:description" content="The OpenMW engine compiled to WebAssembly. Play at morrowind.virtastic.app - free sample world, bring your own copy, or multiplayer.">
+<meta property="og:url" content="https://morrowind.virtastic.app/">
+<meta property="og:image" content="https://morrowind.virtastic.app/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Morrowind in your browser">
+<meta name="twitter:description" content="The OpenMW engine compiled to WebAssembly. Play at morrowind.virtastic.app.">
+<meta name="twitter:image" content="https://morrowind.virtastic.app/og.png">
 <link rel="icon" type="image/png" href="data:image/png;base64,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"><!-- empty favicon: stop the browser's auto /favicon.ico request 404 -->
 <style>
  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000}
@@ -133,6 +152,12 @@
    background:linear-gradient(180deg,#d3a84e,#8a6838);color:#1a1207;border-color:#eecb78;
    transition:filter .15s ease}
  #lkwiz .wz-btn:hover{filter:brightness(1.08)} #lkwiz .wz-btn[disabled]{opacity:.5;cursor:default;filter:none}
+ /* Secondary, deliberately NOT a second gold button: adding the expansions is still the
+    recommended action, and two equal buttons would read as an even choice. */
+ #lkwiz .wz-btn.wz-alt{margin-top:11px;padding:9px 20px;background:none;border-color:transparent;
+   color:#a5987e;letter-spacing:.1em;text-transform:none;font-weight:500;font-size:12.5px;
+   text-decoration:underline;text-underline-offset:3px;text-decoration-color:rgba(165,152,126,.45)}
+ #lkwiz .wz-btn.wz-alt:hover{filter:none;color:#e8c86a;text-decoration-color:rgba(232,200,106,.6)}
  #lkwiz .wz-note{margin:14px 0 0;min-height:18px;font-size:13px;line-height:1.5;color:#a5987e}
  #lkwiz .wz-note.err{color:#e0836a} #lkwiz .wz-note.ok{color:#a9c48a}
  #lkwiz .wz-eula-lead{margin:22px 0 0;text-align:left;font-size:12.5px;line-height:1.55;color:#a5987e}
@@ -195,6 +220,10 @@
     <p class="wz-p lkhelp-tip">Installed to a second drive or a custom Steam library? Use
        <b>Browse local files</b> rather than guessing the path, since Steam puts extra libraries
        wherever you chose (often <code>D:\SteamLibrary\steamapps\common\Morrowind</code>).</p>
+    <p class="wz-p lkhelp-tip">On Windows, the browser refuses to open folders inside
+       <code>Program&nbsp;Files</code> — and Steam's default library lives there, so the picker
+       says the folder <i>"contains system files"</i>. Copy your <b>Data&nbsp;Files</b> folder to
+       Documents or Desktop first, then pick the copy here. (Chrome and Edge behave the same.)</p>
 
     <h3 class="lkhelp-h3">GOG.com</h3>
     <p class="wz-p">In <b>GOG Galaxy</b>, open Morrowind, click the gear beside <b>Play</b> and
@@ -221,7 +250,11 @@
 </div>
 <div id="lkwiz" role="dialog" aria-modal="true" aria-labelledby="lkwiz-h">
   <div class="wz">
-    <div class="wz-kick">Multiplayer &middot; one-time setup</div>
+    <!-- Set at open time: this same wizard serves the CLOUD LOCKER (single player, no world)
+         as well as multiplayer, and saying "Multiplayer" on the cloud tile was wrong long
+         before the expansions became skippable — it just did not contradict anything on
+         screen until rows started reading "optional". See wiz.show(). -->
+    <div class="wz-kick" id="lkwiz-kick">One-time setup</div>
     <button class="wz-help" id="lkwiz-help" type="button"
             aria-label="Where do I find my Data Files folder?">?</button>
     <h2 class="wz-h" id="lkwiz-h">Add your Morrowind files</h2>
@@ -244,7 +277,10 @@
     <!-- No "pick files individually" path: the media alone is ~6,400 voice files, so hand-
          selecting is not a real option. The folder read is targeted (plugins/archives at the
          top level + the five media folders) and nothing else is even enumerated. -->
-    <button class="wz-btn" id="lkwiz-skip" type="button" style="display:none">Skip for now</button>
+    <!-- Shown only once every file THIS session needs is already in the library (see
+         `canSkip`), so it can never wave through the base game or the media. Its label is
+         built from the rows actually missing: "Continue without Tribunal & Bloodmoon". -->
+    <button class="wz-btn wz-alt" id="lkwiz-skip" type="button" style="display:none">Continue without the expansions</button>
     <p class="wz-note" id="lkwiz-note"></p>
     <p class="wz-fine">Your browser asks you to confirm the folder. Only Morrowind's own game files are
        read from it — plugins, archives, music, videos and voices. Nothing else is touched or uploaded,
@@ -284,8 +320,13 @@
        attrs = attrs || {};
        attrs.alpha = false;                 // opaque canvas — desktop framebuffer semantics
        attrs.premultipliedAlpha = false;    // moot with alpha:false; explicit for clarity
+       // 'default' counts as unset: Emscripten's GL layer (which creates THE game context for
+       // SDL) always passes powerPreference:'default' explicitly, so a null-only guard skipped
+       // the one context this hint exists for — and dual-GPU laptops rendered the game on the
+       // power-saving iGPU with the discrete GPU idle.
        if (!window.__NO_GPU_HINT && !/[?&]noopt\b/.test(location.search)
-           && attrs.powerPreference == null) attrs.powerPreference = 'high-performance';
+           && (attrs.powerPreference == null || attrs.powerPreference === 'default'))
+         attrs.powerPreference = 'high-performance';
        // desynchronized disabled — suspected first-frame hang in headless preview.
      }
      var ctx = orig.call(this, type, attrs);
@@ -294,12 +335,39 @@
      // ACCEPTED after getExtension() is called on the context — otherwise glTexParameterf raises
      // GL_INVALID_ENUM. Calling it here lets the OSG anisotropy path work (see Texture.cpp).
      if (ctx && (type === 'webgl2' || type === 'webgl' || type === 'experimental-webgl')) {
+       // Name the GPU that actually got the context in the debug log. On dual-GPU machines
+       // this is the only way to SEE whether the high-performance hint was honored — the
+       // symptom otherwise is just "low FPS" with no cause attached.
+       try {
+         var dbg = ctx.getExtension('WEBGL_debug_renderer_info');
+         var gpu = ctx.getParameter(dbg ? dbg.UNMASKED_RENDERER_WEBGL : ctx.RENDERER);
+         if (window.__omwLog) window.__omwLog('[gl] renderer: ' + gpu
+           + ' (powerPreference: ' + ((ctx.getContextAttributes()||{}).powerPreference || '?') + ')');
+       } catch (e) {}
        try { ctx.getExtension('EXT_texture_filter_anisotropic'); } catch (e) {}
        // EXT_color_buffer_float: makes RGBA16F/RGBA32F color-renderable so post-processing float
        // render targets (e.g. bloom) are FBO-complete instead of rendering black.
        try { ctx.getExtension('EXT_color_buffer_float'); } catch (e) {}
        try { ctx.getExtension('EXT_color_buffer_half_float'); } catch (e) {}
        try { ctx.getExtension('OES_texture_float_linear'); } catch (e) {}
+       // S3TC/DXT, enabled EXPLICITLY for the same reason as the lines above: an extension
+       // has to be fetched before the context will accept its enums. Morrowind ships its
+       // textures as DXT-compressed DDS, so without this every compressed upload fails and
+       // the mesh samples black -- which is what an opaque black tree canopy IS. Reported
+       // from Brave, where the shields' fingerprinting defence can hide extensions from
+       // enumeration and so defeat Emscripten's automatic-enable. Harmless where the
+       // extension was already live; the call is idempotent and returns the same object.
+       try { ctx.getExtension('WEBGL_compressed_texture_s3tc'); } catch (e) {}
+       try { ctx.getExtension('WEBGL_compressed_texture_s3tc_srgb'); } catch (e) {}
+       // Say what actually came back. This is the one line that settles whether a black-
+       // foliage report is a missing S3TC extension or something else entirely -- the
+       // affected machine reports it itself instead of us guessing from a screenshot.
+       try {
+         var exts = ctx.getSupportedExtensions() || [];
+         var comp = exts.filter(function(e){ return /compressed/i.test(e); });
+         if (window.__omwLog) window.__omwLog('[gl] compressed texture formats: '
+           + (comp.length ? comp.join(', ') : 'NONE -- DXT textures cannot upload and will sample BLACK'));
+       } catch (e) {}
        // ?glcount=1 (QA): count GL calls per frame to attribute the Draw phase. Wrap a curated set
        // of hot methods (draws + state changes + uniform uploads) with a counter. Pure diagnostic —
        // the counter increment perturbs timing slightly but COUNTS are exact. window.__glCalls is the
@@ -476,6 +544,14 @@
  function fatalOverlay(title, detail, showReload, opts){
    opts = opts || {};
    killEngine();
+   // A fatal BEFORE the engine is up means the engine must never come up. The loader keeps
+   // downloading and compiling behind the overlay (openmw.js + wasm + data + the pthread
+   // pool), and that work pegs the main thread — the overlay paints, but its button never
+   // hears the click ("Back to the launcher" did nothing). window.stop() cancels every
+   // in-flight fetch; nothing behind a boot fatal is worth finishing. A RUNNING engine is
+   // killEngine()'s job instead (and e.g. the GPU-loss path needs its reload timer, which
+   // window.stop() does not touch).
+   try { if (!(window.Module && (Module.calledRun || Module.__omwRunning))) window.stop(); } catch(e){}
    try {
      // The SAME panel the multiplayer error modal uses. This used to be a monospace slab of
      // terminal-grey text, which read like a stack trace at the exact moment a player needs a
@@ -510,6 +586,9 @@
          + 'font:600 12.5px/1 Optima,"Gill Sans",sans-serif;letter-spacing:.12em;text-transform:uppercase;'
          + 'background:linear-gradient(180deg,#d3a84e,#8a6838);color:#1a1207';
        b.addEventListener('click', function(){
+         // A deliberate leave: never let the unsaved-progress beforeunload guard turn the
+         // one visible way out of a fatal into a "Leave site?" interrogation.
+         window.__omwAllowLeave = true;
          if (opts.actionHref) location.href = opts.actionHref; else location.reload();
        });
        box.appendChild(b);
@@ -1862,6 +1941,16 @@
        var __srcLocal = /[?&]src=local\b/.test(location.search);
        // The locker token rides in the URL FRAGMENT (captured to __omwLockerToken above), not
        // the query string — so key the locker path off the captured token, never location.search.
+       //
+       // "Above" means the multiplayer branch — which only runs with mp=. The cloud-locker
+       // boot (#locker=&mplocker=&cloud=1) deliberately has NO mp=, so without this capture
+       // the token was never read, the locker mount never ran, and the boot fell through to
+       // the server-hosted retail path: an account with a fully uploaded library was told
+       // "No game data on this server". Same library, same account, different door.
+       if (!window.__omwLockerToken) {
+         var clok = /[#&]mplocker=([^&]+)/.exec(location.hash || '');
+         if (clok) window.__omwLockerToken = decodeURIComponent(clok[1]);
+       }
        var __mpLocker = !!window.__omwLockerToken;
        if (__mpLocker) mountLockerMorrowind();       // MP: game data streams from your locker
        else if (__srcLocal) mountLocalMorrowind();   // bring-your-own local folder (single-player)
@@ -2058,7 +2147,9 @@
          function bounce(msg){ append('[locker] '+msg,'err');
            fatalOverlay(window.__omwMPEnabled ? 'Multiplayer sign-in needed' : 'Sign-in needed',
              msg+' Returning to the launcher…', false);
-           setTimeout(function(){ location.href='launcher.html'; }, 2400); }
+           // The auto-redirect is a deliberate leave too — without the flag it raised the
+           // browser's "Leave site?" dialog on top of the overlay whenever the guard was armed.
+           setTimeout(function(){ window.__omwAllowLeave = true; location.href='launcher.html'; }, 2400); }
          try { StreamFS.init(); } catch(e){ return bounce('Streaming unavailable (needs a Chromium browser on desktop).'); }
          if (!TOKEN || !HTTP) return bounce('No locker session. Please sign in again.');
          addRunDependency('mw-local');
@@ -2116,6 +2207,15 @@
            wiz.set('media.tar','busy','verifying…');
            var conf = await (await api('/locker/uploaded',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(rec)})).json();
            if (conf && conf.ok===false) throw new Error('not accepted');
+           // KEEP THE PACK WE JUST BUILT, exactly like the per-file uploader above does. The
+           // reader is keyed by the SAME sha256, so without this the first play session missed
+           // the cache and pulled the whole voice pack back out of S3 — hundreds of megabytes,
+           // re-downloading bytes that were in this tab's memory a moment earlier. That is the
+           // "Downloading voices" the player sees immediately after uploading voices.
+           // Best-effort and last: cachePut swallows QuotaExceeded, and a cache miss only ever
+           // costs a download, so a full cache must never fail the upload that already
+           // succeeded.
+           try { await cachePut(sha, built.blob); } catch(e){ /* non-fatal, see above */ }
            wiz.set('media.tar','done','uploaded');
          }
 
@@ -2147,12 +2247,60 @@
            });
          })();
 
+         // Does THIS session actually have to have this file? The server marks everything its
+         // manifest lists `required` and is right to: multiplayer pins the world's content
+         // list and refuses any client whose own list differs (server/src/core/manifest.ts
+         // ContentGate), so a base-game client cannot join a world that loads the expansions
+         // no matter how politely it asks.
+         //
+         // `soloOptional` rows are required FOR THAT REASON ONLY. The cloud locker is also a
+         // single-player library with no world behind it (launcher's `cloud=1` door), and
+         // there is no content list to match there — so Tribunal and Bloodmoon go back to
+         // being what they are in retail: extra content, not an entry fee. Morrowind itself
+         // and the media are never soloOptional, so this can never wave through a library
+         // that has no game in it.
+         function needs(f){
+           return !!f.required && !(f.soloOptional && !window.__omwMPEnabled);
+         }
+         // The soloOptional rows this library is still missing, for the sentences below.
+         function optionalGap(needed, haveNames){
+           return needed.filter(function(f){
+             if (needs(f)) return false;
+             var k=f.name.toLowerCase();
+             return k.slice(-1)==='/'
+               ? !haveNames.some(function(h){ return h.indexOf(k)===0; })
+               : haveNames.indexOf(k)===-1;
+           });
+         }
+         // "Tribunal & Bloodmoon" from Tribunal.esm/.bsa/Bloodmoon.esm/.bsa — the player owns
+         // expansions, not files, and a button offering to continue without four filenames
+         // reads like an error report.
+         var NAME_ORDER=['tribunal','bloodmoon'];   // release order, as the rest of the page says them
+         function gapLabel(rows){
+           var seen=[];
+           rows.forEach(function(r){
+             var n=r.name.replace(/\.(esm|bsa)$/i,'').replace(/\/$/,'');
+             if (seen.indexOf(n)===-1) seen.push(n);
+           });
+           seen.sort(function(a,b){
+             var ia=NAME_ORDER.indexOf(a.toLowerCase()), ib=NAME_ORDER.indexOf(b.toLowerCase());
+             if (ia===-1 && ib===-1) return 0;          // unknown names keep the server's order
+             return (ia===-1?99:ia) - (ib===-1?99:ib);
+           });
+           return seen.length>1 ? seen.slice(0,-1).join(', ')+' & '+seen[seen.length-1] : (seen[0]||'them');
+         }
+
          var wiz = (function(){
            var el=document.getElementById('lkwiz'), list=document.getElementById('lkwiz-list'),
                noteEl=document.getElementById('lkwiz-note'), pick=document.getElementById('lkwiz-pick');
            var rows={};
            return {
-             show:function(){ el.classList.add('show'); },
+             show:function(){
+               var k=document.getElementById('lkwiz-kick');
+               if (k) k.innerHTML = (window.__omwMPEnabled ? 'Multiplayer' : 'Cloud locker')
+                 + ' &middot; one-time setup';
+               el.classList.add('show');
+             },
              hide:function(){ el.classList.remove('show'); },
              onPick:function(cb){ pick.onclick=cb; },
              setPick:function(label,enabled){ pick.textContent=label; pick.disabled=!enabled; },
@@ -2168,13 +2316,14 @@
                    ? haveNames.some(function(h){ return h.indexOf(key)===0; })
                    : haveNames.indexOf(key)!==-1;
                  var label = LABEL[key] || f.name;
-                 var li=document.createElement('li'); li.className='wz-li'+(f.required?'':' opt')+(done?' done':'');
+                 var req=needs(f);
+                 var li=document.createElement('li'); li.className='wz-li'+(req?'':' opt')+(done?' done':'');
                  li.innerHTML='<span class="ic">'+(done?'✓':'')+'</span>'
                    +'<span class="nm">'+label+'</span>'
-                   +(f.required?'':'<span class="tag">optional</span>')
+                   +(req?'':'<span class="tag">optional</span>')
                    +'<span class="st">'+(done?'in your library':(Math.round(f.size/1048576)+' MB'))+'</span>';
                  list.appendChild(li);
-                 rows[key]={li:li,req:f.required,ic:li.querySelector('.ic'),st:li.querySelector('.st')};
+                 rows[key]={li:li,req:req,ic:li.querySelector('.ic'),st:li.querySelector('.st')};
                });
              },
              set:function(name,state,text){
@@ -2195,15 +2344,18 @@
          // find the plugins, archives and media inside it ourselves. Nothing but Morrowind's
          // own files is ever read or uploaded — the matching below is the whole allow-list,
          // and the server re-checks every byte against its manifest regardless.
-         async function runWizard(needed, haveNames){
+         async function runWizard(needed, haveNames, warnNote){
            return new Promise(function(resolve){
              var fileNeeded = needed.filter(function(f){ return !f.media; });
              var mediaRow = needed.find(function(f){ return f.media; });
              var have = haveNames.slice();
-             wiz.render(needed, have); wiz.note('');
+             // A repeat visit caused by a REJECTED upload opens with the reason, not a blank
+             // panel that looks identical to a first visit.
+             wiz.render(needed, have); wiz.note(warnNote || '', warnNote ? 'err' : '');
              var fileInput=document.getElementById('lkwiz-file');
              var dirInput=document.getElementById('lkwiz-dir');
              var pick=document.getElementById('lkwiz-pick');
+             var skip=document.getElementById('lkwiz-skip');
              var alt=null; // individual-file picker removed: hand-picking 6,400 media files is not viable
              var eula=document.getElementById('lkwiz-eula');
              var boxes=['eula-own','eula-legal','eula-understand'].map(function(id){ return document.getElementById(id); });
@@ -2256,32 +2408,82 @@
                if (!window.showDirectoryPicker){ dirInput.click(); return; } // older browser fallback
                var res;
                try { res = await pickFolderTargeted(); }
-               catch(e){ if (e && e.name === 'AbortError') return; wiz.note('Could not read that folder: '+(e&&e.message||e),'err'); return; }
+               catch(e){
+                 if (e && e.name === 'AbortError') return;
+                 // Chromium refuses folders inside system locations (Program Files, Windows, …).
+                 // Steam's default library lives under C:\Program Files (x86)\Steam\, so a default
+                 // Steam install trips this — same handling as the launcher's local-play picker.
+                 if (e && (e.name==='SecurityError' || /system files|blocklist/i.test((e && e.message)||''))){
+                   wiz.note('That folder is in a location the browser won’t open (Windows blocks Program Files, including Steam’s default C:\\Program Files (x86)\\Steam\\ folder). This is the same in Chrome and Edge. Copy your Data Files folder to Documents or Desktop and pick the copy here.','err');
+                   return;
+                 }
+                 wiz.note('Could not read that folder: '+(e&&e.message||e),'err'); return;
+               }
                var list = res.files;
                if (!list.length){
                  wiz.note('Nothing this server needs is in that folder. Pick the folder that holds Morrowind.esm (usually "Data Files").','err');
                  return;
                }
                // Say up front what is not there, rather than discovering it after an upload.
-               if (res.notFound.length) wiz.note('Not in that folder: '+res.notFound.join(', ')+'. Continuing with what is.','err');
+               // A folder with no Tribunal/Bloodmoon is now an ORDINARY folder, so it must not
+               // be reported in red as though something had gone wrong — that red line is the
+               // whole reason a base-game owner used to think the uploader had failed them.
+               if (res.notFound.length){
+                 var lostReq = res.notFound.filter(function(n){
+                   var row = needed.find(function(f){ return f.name.toLowerCase()===String(n).toLowerCase(); });
+                   return !row || needs(row);
+                 });
+                 if (lostReq.length) wiz.note('Not in that folder: '+res.notFound.join(', ')+'. Continuing with what is.','err');
+                 else wiz.note('No '+gapLabel(res.notFound.map(function(n){ return {name:String(n)}; }))
+                   +' in that folder — they are optional here, so we will carry on without them.','');
+               }
                else wiz.note('Found everything this server needs ('+list.length+' files). Checking…','');
                busy=true; pick.disabled=true;
                ingest(list);
              };
              if (alt) alt.onclick=function(){ if(!busy) fileInput.click(); };
 
+             // CONTINUE WITHOUT THE OPTIONAL ONES. Offered only once every row this session
+             // actually needs is already in the library, so it can never be a way past the
+             // base game or the media — and it is a plain text link rather than a second gold
+             // button, because "add my expansions" is still the action being recommended.
+             //
+             // This is also the wizard's only way OUT — it is a modal with no close control. The
+             // checklist is re-offered on EVERY launch until the files are actually uploaded
+             // (see the boot gate below), which is what keeps "I will do it later" possible;
+             // this link is what stops that offer from being a wall.
+             var gap = optionalGap(needed, have);
+             var canSkip = gap.length > 0 && needed.every(function(f){
+               if (!needs(f)) return true;
+               var k=f.name.toLowerCase();
+               return k.slice(-1)==='/'
+                 ? have.some(function(h){ return h.indexOf(k)===0; })
+                 : have.indexOf(k)!==-1;
+             });
+             if (canSkip){
+               skip.textContent='Continue without '+gapLabel(gap);
+               skip.style.display='';
+               skip.onclick=function(){ if (busy) return; wiz.hide(); resolve(null); };
+             } else {
+               skip.style.display='none';
+               skip.onclick=null;
+             }
+
              // A RETURNING player has already attested; they are here because the server needs
              // files they have not uploaded yet. Skip the ownership checkboxes and go straight
-             // to the folder pick. Nothing here is skippable: every row is content this server
-             // loads, so a client without it cannot play the world the server is authoring.
+             // to the folder pick.
              if (have.length){
-               wiz.note('Your library is missing some of this server’s game files. Choose your Data Files folder to add them.','');
+               wiz.note(canSkip
+                 ? 'You can add ' + gapLabel(gap) + ' whenever you like — choose your Data Files '
+                   + 'folder and we will take just those. Nothing already uploaded is sent again.'
+                 : 'Your library is missing some of this server’s game files. Choose your Data Files folder to add them.','');
                pick.disabled=false; eula.style.display='none';
                if (alt) alt.style.display='';
              }
              wiz.show();
 
-             function stop(msg){ wiz.note(msg,'err'); busy=false; eula.style.display=''; pick.disabled=false; pick.textContent='Try again'; if (alt) alt.style.display=''; }
+             function stop(msg){ wiz.note(msg,'err'); busy=false; eula.style.display=''; pick.disabled=false; pick.textContent='Try again'; if (alt) alt.style.display='';
+               if (canSkip) skip.style.display=''; }
              function done(){
                wiz.note('All set. Starting Morrowind.','ok');
                (async function(){
@@ -2319,6 +2521,23 @@
              async function ingest(list){
                var core={}, loose=[], voice=[];
                var wanted={}; fileNeeded.forEach(function(f){ wanted[f.name.toLowerCase()]=f.name; });
+               // WHAT THE PACK IS ALLOWED TO CONTAIN. The server verifies media.tar entry by
+               // entry and deletes the ENTIRE pack if it finds one path its manifest does not
+               // know — asynchronously, after the wizard has already said "uploaded". Two
+               // genuine retail installs differ in which media is loose and which lives in a
+               // BSA, so a real copy carrying one extra file (observed: Sound/Cr/alamlexia/)
+               // silently lost all 166 MB and was asked for the voices again on every launch.
+               // Ask the server what it recognizes and pack only that; anything else is not
+               // wanted by this world anyway. A failed fetch falls back to packing everything
+               // (exactly the old behaviour) — no worse than before, and never a hard block.
+               var packable = null, skippedVoice = 0;
+               try {
+                 var pm = await api('/locker/media-manifest');
+                 if (pm.ok){
+                   var names = (await pm.json()).files || [];
+                   if (names.length){ packable = {}; names.forEach(function(n){ packable[String(n).toLowerCase()] = 1; }); }
+                 }
+               } catch(e){ append('[locker] media manifest unavailable ('+(e&&e.message||e)+') — packing unfiltered','err'); }
                list.forEach(function(f){
                  // __rel: set by the targeted showDirectoryPicker walk. webkitRelativePath:
                  // the <input webkitdirectory> fallback. name: a plain multi-file pick.
@@ -2326,7 +2545,12 @@
                  var base=rel.split('/').pop();
                  var m=rel.match(/(?:^|\/)((?:Sound|Music|Video|Fonts|Splash)\/.+)$/i);
                  if (m && MEDIA_EXT_RE.test(m[1])){
-                   if (/^Sound\//i.test(m[1])) voice.push({ path:m[1], file:f });
+                   // Only Sound/ is filtered: loose media uploads per file, where an
+                   // unrecognized one is refused on its own and costs nothing else.
+                   if (/^Sound\//i.test(m[1])){
+                     if (!packable || packable[m[1].toLowerCase()]) voice.push({ path:m[1], file:f });
+                     else skippedVoice++;
+                   }
                    else loose.push({ path:m[1], file:f });
                  } else if (wanted[base.toLowerCase()] && /\.(esm|esp|bsa|omwaddon)$/i.test(base)){
                    core[base.toLowerCase()]=f; // canonical spelling comes from the manifest
@@ -2337,7 +2561,7 @@
                // anything under that prefix (or, for voice, any Sound/ file to pack).
                var picked = loose.map(function(e){ return e.path.toLowerCase(); });
                var missing = needed.filter(function(f){
-                 if (!f.required) return false;
+                 if (!needs(f)) return false;
                  var k=f.name.toLowerCase();
                  if (k === 'media.tar') return !voice.length && have.indexOf('media.tar')===-1;
                  if (k.slice(-1) === '/'){
@@ -2353,6 +2577,7 @@
                  return;
                }
                busy=true; pick.disabled=true; eula.style.display='none'; if (alt) alt.style.display='none';
+               skip.style.display='none';   // an upload is running; leaving now would abandon it
 
                // Hash the core files first so ownership is attested over the real list.
                var records=[];
@@ -2370,7 +2595,7 @@
                for (const rec of records){
                  if (!(await put(rec, core[rec.name.toLowerCase()], rec.name))) failed.push(rec.name);
                }
-               var reqFailed = failed.filter(function(n){ return (fileNeeded.find(function(x){return x.name===n;})||{}).required; });
+               var reqFailed = failed.filter(function(n){ return needs(fileNeeded.find(function(x){return x.name===n;})||{}); });
                if (reqFailed.length) return stop('Could not add: '+reqFailed.join(', ')+'. Make sure they are genuine Morrowind files, then try again.');
 
                // Loose media (Music/Video/Splash/Fonts): per-file uploads, but the CHECKLIST
@@ -2398,6 +2623,8 @@
                  }
                }
                // Voice: thousands of tiny files, so one packed upload.
+               if (skippedVoice) append('[locker] packing '+voice.length+' voice files; skipped '
+                 + skippedVoice + ' this server does not use.');
                if (voice.length && mediaRow && have.indexOf('media.tar')===-1){
                  try { await uploadMediaPack(voice); }
                  catch(e){ wiz.set('media.tar','err','failed'); wiz.note('Voices could not be added ('+(e&&e.message||e)+'). Starting without them.','err'); }
@@ -2422,9 +2649,20 @@
          }
 
          (async function(){
-           var files;
-           try { files = (await (await api('/locker/files')).json()).files; }
+           var files, mediaPack = null;
+           try {
+             var lf = await (await api('/locker/files')).json();
+             files = lf.files; mediaPack = lf.mediaPack || null;
+           }
            catch(e){ return bounce('Could not reach your locker on the server.'); }
+           // A pack that was accepted and then failed its content check is deleted server-side
+           // AFTER the wizard reported success, so being asked for the voices again is the only
+           // symptom. Say what the server decided instead of silently re-asking.
+           if (mediaPack && mediaPack.reason && mediaPack.reason !== 'ok'){
+             append('[locker] your last voice upload was rejected: ' + mediaPack.reason
+               + (mediaPack.detail ? ' (' + mediaPack.detail + ')' : '')
+               + ' at ' + mediaPack.at, 'err');
+           }
            // The wizard runs when the locker is EMPTY, and also when it is merely INCOMPLETE:
            // an account that uploaded before the manifest knew about music/videos/voices has
            // the plugins but none of the media, and would otherwise silently keep playing a
@@ -2458,6 +2696,16 @@
              return have.indexOf(k)!==-1;
            }
            var missing = needed.filter(function(f){ return !satisfied(f); });
+           // ANYTHING missing still opens the checklist, expansions included — and that is the
+           // deliberate choice, not an oversight. The wizard is the only route back to it, so
+           // an optional gap that stopped re-offering itself would mean a player who skipped
+           // Tribunal once could never add it again without support. Offering it every launch
+           // costs one click to decline (the "Continue without…" link, which appears precisely
+           // when the only gap left is optional) and keeps the door open for ever.
+           //
+           // What the optional flag changes is that the offer is DECLINABLE, not that it stops
+           // being made: `missingReq` is what may hold the player here against their will.
+           var missingReq = missing.filter(needs);
            if (!files || !files.length){
              if (!needed.length) {
                return bounce(neededFailed
@@ -2470,15 +2718,31 @@
            } else if (missing.length){
              append('[locker] have '+have.length+' of '+needed.length+' — missing: '
                + missing.map(function(m){ return m.name; }).join(', '));
-             try { files = await runWizard(needed, have) || files; }
+             var rejectNote = (mediaPack && mediaPack.reason && mediaPack.reason !== 'ok')
+               ? (mediaPack.reason === 'unknown_entry'
+                   ? 'Your last voice upload was rejected: it contained a file this server does not use'
+                     + (mediaPack.detail ? ' (' + mediaPack.detail + ')' : '')
+                     + '. Pick the same folder again — those files are now left out.'
+                   : 'Your last voice upload was rejected by the server (' + mediaPack.reason
+                     + '). Pick your Data Files folder to try again.')
+               : '';
+             try { files = await runWizard(needed, have, rejectNote) || files; }
              catch(e){
                // Never swallow this: a wizard that fails to open leaves the player with a
                // half-installed game and no explanation of why.
                append('[locker] upload wizard failed to open: '+(e&&e.message||e),'err');
-               fatalOverlay('Your game files are incomplete',
-                 'This server needs: '+missing.map(function(m){ return m.name; }).join(', ')
-                 + '. The uploader could not open ('+(e&&e.message||e)+'). Reload to try again.', false);
-               return;
+               // Fatal ONLY when the gap was one this session cannot play without. A player who
+               // came here from "Add game files" to add their expansions has a perfectly good
+               // library already; stranding them behind an unclosable overlay because the
+               // optional extra could not be offered would be a worse outcome than the gap.
+               if (!missingReq.length){
+                 append('[locker] carrying on without '+missing.map(function(m){ return m.name; }).join(', ')+'.');
+               } else {
+                 fatalOverlay('Your game files are incomplete',
+                   'This server needs: '+missingReq.map(function(m){ return m.name; }).join(', ')
+                   + '. The uploader could not open ('+(e&&e.message||e)+'). Reload to try again.', false);
+                 return;
+               }
              }
            } else {
              append('[locker] library complete ('+have.length+' items).');
@@ -2489,6 +2753,18 @@
            // So DOWNLOAD content files in full into memory (they total ~90MB) and only STREAM the
            // big BSAs (meshes/textures, read a little at a time). This mirrors the retail path.
            var LD = window.__omwLoading;
+           // SHOW IT, don't just set() it. set() writes values into the overlay; show() is what
+           // makes the overlay VISIBLE, and by this point it is almost always hidden — the boot
+           // screen finished while the upload wizard (its own overlay) was on top. So the
+           // download loop below reported progress into an element with display:none and the
+           // player watched a BLACK SCREEN for minutes while hundreds of megabytes came down,
+           // with no indication anything was happening. Reported as "after upload the screen
+           // just goes black, then four minutes later the game started".
+           //
+           // show(), not lock(): a lock that never clears strands the player behind a screen
+           // they cannot dismiss, which is worse than this was. The engine's own boot takes the
+           // screen over when it starts.
+           if (LD) LD.show('Preparing your game', 'Fetching your files…');
            function ldSet(pct,label,detail){ if(LD) LD.set(pct,label,detail); }
            async function fetchFull(url, size, name){
              var r = await fetch(url);
@@ -3482,7 +3758,23 @@
     // right because the identical line in launcher.html works, where the document differs.
     // Set the hash first, then force the reload, so the destination boots from the new
     // fragment whether or not the path happens to match.
-    var url = new URL('index.html', location.href);
+    // KEEP THE QUERY STRING. `new URL('index.html', ...)` has an EMPTY search, so the
+    // location.assign() below navigated to a bare index.html and dropped every query
+    // parameter the page was launched with -- ?stream, ?novid, ?skipintro, ?start=, the lot.
+    // The engine then boots as if it had been opened cold: a switch quietly changed how the
+    // game starts, and a SECOND switch landed on a page with Module loaded and no game
+    // running at all. It also made the equality test below always false, so the reload path
+    // that comment describes was never the one taken.
+    // ...MINUS the keys the new fragment supersedes. The launch URL may carry mp= in the
+    // QUERY (that is how the harness and a deep link start a session), and the destination
+    // for this switch goes in the FRAGMENT -- so keeping the query wholesale re-armed the OLD
+    // world's address and the page booted straight back into the world it was leaving. Same
+    // list as the fragment filter above, for the same reason.
+    var q = new URLSearchParams(location.search);
+    ['mp', 'mpticket', 'mpstart', 'mpnew'].forEach(function(k){ q.delete(k); });
+    if (swChar) { q.delete('mpchar'); q.delete('mpcharname'); }
+    var qs = q.toString();
+    var url = new URL('index.html' + (qs ? '?' + qs : ''), location.href);
     url.hash = keep.join('&');
     if (url.pathname === location.pathname && url.search === location.search) {
       location.hash = keep.join('&');
@@ -3520,6 +3812,42 @@
       try {
         Promise.resolve(rebootIntoWorld(want)).catch(failed);
       } catch (e) { failed(e); }
+    }, 250);
+  })();
+
+  // SSO auth rescue. The engine's auth ladder publishes needFreshTicket ("stamp|target|why")
+  // when it dead-ends with no usable credential — a spent ticket, or a drop with no resume
+  // token (the reaped-world case: switch to public, your own world idles out, switch back,
+  // and the revived process knows nothing about you). The only credential that can work is
+  // a fresh single-use ticket, and only this page can mint one (the locker token lives
+  // here). Answer by rebooting into the same world through rebootIntoWorld — the identical
+  // proven path a manual world switch takes, so nothing new can leak.
+  //
+  // BOUNDED: three rescues per ten minutes, per tab. A server refusing every fresh ticket
+  // is a real refusal (ban, dead session) and must surface as the Failed modal — which it
+  // does, because an unanswered ask times out in Lua (net.tick) and fails the old way.
+  (function watchTicketRescue(){
+    var seen = '';
+    setInterval(function(){
+      var want = String((window.__omwMP || {}).needFreshTicket || '');
+      if (!want || want === seen) return;
+      seen = want;
+      var target = want.split('|')[1] || '';
+      var why = want.split('|')[2] || 'auth dead-end';
+      if (!target) { mpLog('[mp] auth rescue asked with no target — ignoring', 'err'); return; }
+      var RKEY = 'omw-sso-rescues';
+      var now = Date.now(), hist = [];
+      try { hist = JSON.parse(sessionStorage.getItem(RKEY) || '[]').filter(function(t){ return now - t < 600000; }); } catch (e) {}
+      if (hist.length >= 3) {
+        mpLog('[mp] auth rescue suppressed — ' + hist.length + ' rejoins in 10 minutes; letting the failure surface', 'err');
+        return; // Lua's deadline turns this into the terminal modal
+      }
+      hist.push(now);
+      try { sessionStorage.setItem(RKEY, JSON.stringify(hist)); } catch (e) {}
+      mpLog('[mp] ' + why + ' — minting a fresh ticket and rejoining');
+      Promise.resolve(rebootIntoWorld(target)).catch(function(e){
+        mpLog('[mp] auth rescue failed: ' + e, 'err'); // Lua's deadline shows the modal
+      });
     }, 250);
   })();
 
@@ -4425,10 +4753,30 @@
       // "Connection lost, reconnecting" for a connection that had never existed. Same state,
       // two different situations, and only one of them is a loss.
       if (wantHold) {
-        if (everJoinedOnce) window.__omwLoading.show('Connection lost', 'Reconnecting…');
+        // THREE DIFFERENT SITUATIONS, three different sentences. "Connection lost" is a lie
+        // before the first join (the world is still coming up), and it is also a lie when the
+        // SERVER told us it was restarting — that is a deploy or a rolling restart, it is
+        // expected, it is brief, and saying so is the difference between "something broke" and
+        // "hang on a second".
+        if (String((window.__omwMP || {}).serverRestarting || '') === '1') {
+          window.__omwLoading.show('The server is restarting', 'Putting you back in…');
+        } else if (everJoinedOnce) window.__omwLoading.show('Connection lost', 'Reconnecting…');
         else window.__omwLoading.show('Starting your world', 'Waking the server, this takes a moment…');
       }
-      else { window.__omwLoading.hide(); setStatus('Reconnected.'); }
+      // NOT WHILE THE BOOT SETTLE OWNS THE SCREEN. The first dial into a world that is still
+      // coming up is routinely refused and retried, so a normal first join passes THROUGH
+      // 'Reconnecting' and out again — and this hide() then tore down the boot screen while
+      // __omwMPSettling was still true and the world had not settled. holdUntilSimulated's
+      // 250 ms poll put it straight back up ("Almost there"), which is the drop-and-return
+      // flicker, with the engine's music starting in the gap. The settle hold is the single
+      // owner of that screen and clears it itself (or by its own dead man's switch).
+      else {
+        if (!window.__omwMPSettling) window.__omwLoading.hide();
+        setStatus('Reconnected.');
+        // Back in. Consume the restart flag so an ordinary drop later is not still blamed on a
+        // restart that finished minutes ago.
+        try { if (window.__omwMP) window.__omwMP.serverRestarting = ''; } catch (e) {}
+      }
     }
     if (socialOpen) renderSocial();
   }, 150);
@@ -4506,9 +4854,15 @@
         // authority and corrects the position, which is the rubber-banding on first join.
         // Absent key = a server that predates SimReady, or single-player: never hold.
         var ready = st.simReady;
-        if (ready === undefined || ready === '1' || Date.now() > hideAt) {
+        // Same owner rule as above. simReady === '1' is where holdUntilSimulated STARTS its
+        // 5 s settling grace, not where it finishes — so hiding here on readiness alone
+        // dropped the screen mid-grace on any cell load during the boot settle, handing back
+        // the exact seconds the grace exists to cover. The ceiling still wins, so this can
+        // never strand a player.
+        var settleOwns = !!window.__omwMPSettling && Date.now() <= hideAt;
+        if (!settleOwns && (ready === undefined || ready === '1' || Date.now() > hideAt)) {
           window.__omwLoading.hide(); hideAt = 0; saidWaiting = false;
-        } else if (!saidWaiting) {
+        } else if (!saidWaiting && !settleOwns) {
           // Say why the wait continues rather than leaving a stalled "Entering a new area".
           // Once only: this runs every frame.
           saidWaiting = true;

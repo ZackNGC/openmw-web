@@ -22,6 +22,20 @@ const MAX_RECORD_ID = 64;
 const MAX_COUNT = 10000;
 const MAX_CELL_KEY = 128;
 const MAX_CONTAINER_ENTRIES = 512;
+// A single barter window cannot move more gold than the richest vendor in the game holds many
+// times over. This does not stop a player selling honestly; it bounds GRIEFING -- a negative
+// delta drains a merchant's purse for everyone in the world, and nothing else caps it.
+const MAX_GOLD_DELTA = 1000000;
+// fBarterGoldResetDelay. The engine restocks a merchant's purse every 24 GAME hours
+// (dialogue.cpp), and only the purse -- not their stock -- so this matches that exactly
+// rather than inventing a richer rule.
+const GOLD_RESTOCK_HOURS = 24;
+
+// Morrowind's calendar: 12 months of 28 days, no leap years. Collapsed to one number so two
+// readings can be compared; only DIFFERENCES matter, so the epoch is arbitrary.
+function absGameHours(t: { gameHour: number; day: number; month: number; year: number }): number {
+  return (((t.year * 12 + (t.month - 1)) * 28) + (t.day - 1)) * 24 + t.gameHour;
+}
 
 const WORLD_EVENTS = new Set([
   'ObjectSpawnRequest',
@@ -37,7 +51,11 @@ const WORLD_EVENTS = new Set([
 
 // M4 actor events (all holder-only, epoch-guarded). ActorSnapshot is stored, not relayed;
 // ActorDeath is deduped/persisted/tallied; the rest relay cell-scoped (excluding sender).
-const ACTOR_RELAY_EVENTS = new Set(['ActorStatsDynamic', 'ActorEquip', 'ActorAI']);
+// ActorDisposition joins these because base disposition is genuinely SHARED state, not a
+// per-player opinion: getBaseDisposition(npc, player) ignores its player argument entirely and
+// reads getNpcStats(npc).getBaseDisposition(). One value on the NPC, so a bribe or a threat by
+// one player has to reach the others or the world stops agreeing about who likes whom.
+const ACTOR_RELAY_EVENTS = new Set(['ActorStatsDynamic', 'ActorEquip', 'ActorAI', 'ActorDisposition']);
 const ACTOR_EVENTS = new Set([...ACTOR_RELAY_EVENTS, 'ActorSnapshot', 'ActorDeath']);
 
 function str(v: LValue | undefined, max: number): string | undefined {
@@ -90,6 +108,14 @@ export class WorldState {
 
   // Public-realm rules: unique NPCs respawn (the world is stateless) and therefore must
   // not be farmable. Off by default — a private or party campaign keeps vanilla loot.
+  /** Turn the unowned-drop SIGNAL into a refusal. Requires clients that report acquisitions
+   *  per event (PlayerItemAcquired); see the spawn handler for why it is not on by default. */
+  private refuseUnownedDrops = false;
+
+  setDropEnforcement(on: boolean): void {
+    this.refuseUnownedDrops = on;
+  }
+
   setEconomyRules(opts: { uniqueActors: Iterable<string>; noDrop: boolean }): void {
     this.uniqueActors = new Set([...opts.uniqueActors].map((s) => s.toLowerCase()));
     this.noDrop = opts.noDrop;
@@ -117,6 +143,19 @@ export class WorldState {
     this.heldCount = fn;
   }
 
+  // SPENDING the per-event acquisition credit, which is not optional bookkeeping.
+  //
+  // The credit exists because the inventory snapshot is a 2 s diff and a player can pick
+  // something up and drop it before their own declaration catches up. But a snapshot is only
+  // sent when the inventory CHANGES, and acquire-then-drop leaves it unchanged — so no snapshot
+  // arrives, the credit is never superseded, and it sits there funding a second drop of
+  // something that was only ever acquired once. Consume it at the point it is used.
+  private debitAcquired?: (player: Player, recordId: string, count: number) => void;
+
+  setInventoryDebit(fn: (player: Player, recordId: string, count: number) => void): void {
+    this.debitAcquired = fn;
+  }
+
   private moderationNote?: (accountKey: string, kind: string) => void;
 
   setModerationNote(fn: (accountKey: string, kind: string) => void): void {
@@ -130,8 +169,9 @@ export class WorldState {
   // hand anything to anyone else in the SHARED world. They may still cheat their own
   // campaign, which harms nobody.
   //
-  // ponytail: quarantine the ACCOUNT, not the item. Per-item provenance needs the
-  // observability work first; this needs nothing new and protects strangers today.
+  // Per-item provenance now EXISTS (PlayerItemAcquired + refuseUnownedDrops), but it is off by
+  // default and covers drops only. Containment stays: it is the backstop for every acquisition
+  // path the ledger does not see, and for the case where the ledger is switched off.
   private quarantined?: (accountKey: string) => boolean;
 
   setQuarantineCheck(fn: (accountKey: string) => boolean): void {
@@ -143,6 +183,9 @@ export class WorldState {
     return this.noDrop && this.quarantined?.(player.accountKey) === true;
   }
 
+  /** Set by the server: a cell gained an authority holder. See the grant callback below. */
+  onHolderGained?: (cellKey: string) => void;
+
   constructor(
     private readonly roster: Roster,
     private readonly cells: CellStore,
@@ -152,8 +195,13 @@ export class WorldState {
     // a capable client can hold, so the existing authority-mechanism tests still exercise it.
   ) {
     this.authority = new Authority({
-      grant: (playerId, cellKey, epoch, snapshot) =>
-        this.roster.get(playerId)?.peer.sendEvent('ActorAuthorityGrant', { cellKey, epoch, snapshot }),
+      grant: (playerId, cellKey, epoch, snapshot) => {
+        this.roster.get(playerId)?.peer.sendEvent('ActorAuthorityGrant', { cellKey, epoch, snapshot });
+        // A cell that just got a simulator may have swings parked on it (combat.ts `hold`),
+        // from the window where it had none. Deliver them now rather than having cost those
+        // players the attack.
+        this.onHolderGained?.(cellKey);
+      },
       revoke: (playerId, cellKey, epoch) =>
         this.roster.get(playerId)?.peer.sendEvent('ActorAuthorityRevoke', { cellKey, epoch }),
       info: (playerId, cellKey, holderId, epoch) =>
@@ -502,24 +550,38 @@ export class WorldState {
         player: player.name, account: player.accountKey, recordId, count, held,
         fromInventory, refused: fromInventory && this.noDrop,
       });
-      // STILL NOT REFUSED, and this was measured twice, not assumed.
+      // REFUSABLE AT LAST — both blockers are gone, and it took both.
       //
-      // fromInventory fixed the first false positive (placements are no longer mistaken for
-      // drops), so refusal was tried again — and s30 failed: a player who picks something up
-      // and drops it immediately outruns their own 2 s inventory diff, so the server has not
-      // yet been told they hold it. That is ordinary play, not cheating.
+      // fromInventory fixed the first false positive: this op is the generic "place an object",
+      // which scripts and tools use for things nobody carries (s30/s31 spawn a CHEST), so
+      // without it conservation refused legitimate placements.
       //
-      // Enforcement therefore lives at the ACCOUNT level (containment, see contained()),
-      // which keys on declarations that have no innocent explanation. This stays a signal —
-      // now a precise one, since it can no longer fire on a scripted placement.
-      // ponytail: refuse here only once acquisition is reported per-event rather than by a
-      // 2 s snapshot diff; the race is the blocker, not the rule.
+      // The second was a RACE, not a rule: a player who picks something up and drops it
+      // immediately outruns their own 2 s inventory diff, so the server had not yet been told
+      // they held it. PlayerItemAcquired now credits acquisitions per event and the oracle adds
+      // them, so "you cannot drop what you do not have" is finally a question the server can
+      // answer in time. That is what `refuseUnownedDrops` turns on.
+      //
+      // OFF BY DEFAULT, and that is deliberate rather than timid: the credit path is only as
+      // complete as the client that reports it, and this repo has already backed this
+      // enforcement out once. It stays a signal until the browser scenarios have exercised
+      // every acquisition path against a real engine. Account-level containment (contained())
+      // is unchanged and still the working defence in the meantime.
+      if (this.refuseUnownedDrops && fromInventory) {
+        metrics.unownedDropsRefused.inc();
+        log('warn', 'object.unowned_drop_refused', {
+          player: player.name, account: player.accountKey, recordId, count, held,
+        });
+        return; // no ack, no placement
+      }
     }
     if (this.contained(player)) {
       metrics.containedActions.inc({ action: 'drop' });
       log('warn', 'contain.drop_refused', { player: player.name, account: player.accountKey, recordId });
       return; // no ack, no placement: nothing they declared reaches the shared world
     }
+    // The drop is going ahead, so whatever credit backed it is now spent (see setInventoryDebit).
+    if (fromInventory) this.debitAcquired?.(player, recordId, count);
     const doc = await this.cells.get(cellKey);
     const netId = this.cells.allocNetId();
     const placed = { netId, recordId, cellKey, x, y, z, rotZ, count, byId: player.id };
@@ -667,13 +729,41 @@ export class WorldState {
       }
       // origin: a copy, not an alias — `items` is mutated in place by every take/put.
       cont = { items: contents, stateSeq: 1, origin: contents.map((i) => ({ ...i })) };
+      // A merchant's purse becomes canonical on the same first-opener rule as the stock, and
+      // goldOrigin is captured for the same reason `origin` is: a restock has to have
+      // something to restore to, and only the first opener ever sees the untouched figure.
+      const gold = finite(body.get('gold'));
+      if (gold !== undefined && gold >= 0) {
+        cont.gold = Math.floor(gold);
+        cont.goldOrigin = cont.gold;
+        cont.goldRestockAt = absGameHours(this.cells.worldM7().time) + GOLD_RESTOCK_HOURS;
+      }
       doc.containers[ref.key] = cont;
       this.cells.markDirty(cellKey);
+    }
+    // THE 24h RESTOCK, checked on open because that is when anyone can observe it. Without
+    // this a merchant drained on day one stays drained for the life of the world: the engine
+    // restocks on the client's own calendar, which only ever moved that client's LOCAL value,
+    // and canonical is set once by the first opener and never again.
+    if (cont.goldOrigin !== undefined && cont.goldRestockAt !== undefined) {
+      const nowH = absGameHours(this.cells.worldM7().time);
+      if (nowH >= cont.goldRestockAt) {
+        // Snapped forward from NOW rather than advanced by one period: a world left alone for
+        // a month should restock once on the next visit, not run the loop thirty times.
+        cont.goldRestockAt = nowH + GOLD_RESTOCK_HOURS;
+        if (cont.gold !== cont.goldOrigin) {
+          cont.gold = cont.goldOrigin;
+          cont.stateSeq += 1;
+          this.cells.markDirty(cellKey);
+          log('debug', 'world.merchant_restock', { cellKey, gold: cont.gold });
+        }
+      }
     }
     player.peer.sendEvent('ContainerState', {
       ...objRefToJs(ref),
       items: cont.items.map((i) => ({ ...i })),
       stateSeq: cont.stateSeq,
+      ...(cont.gold !== undefined ? { gold: cont.gold } : {}),
     });
   }
 
@@ -685,7 +775,13 @@ export class WorldState {
     const op = body.get('op');
     const itemId = str(body.get('itemId'), MAX_RECORD_ID);
     const n = itemCount(body.get('n'));
-    if (opId === undefined || (op !== 'take' && op !== 'put') || !itemId || n === undefined) {
+    // 'gold' is the merchant-purse op and carries a SIGNED delta instead of an item, so it is
+    // validated separately from take/put rather than bent through itemCount (which requires >= 1).
+    const isGold = op === 'gold';
+    const goldDelta = isGold ? finite(body.get('goldDelta')) : undefined;
+    if (opId === undefined || (op !== 'take' && op !== 'put' && !isGold)
+        || (isGold ? (goldDelta === undefined || !Number.isInteger(goldDelta)
+                     || Math.abs(goldDelta) > MAX_GOLD_DELTA) : (!itemId || n === undefined))) {
       this.invalid(player, 'ContainerOpRequest');
       return;
     }
@@ -694,6 +790,29 @@ export class WorldState {
       player.peer.sendEvent('ContainerOpResult', { opId, ok, ...(reason ? { reason } : {}), stateSeq });
     if (!cont) {
       reply(false, 'nostate', 0); // container never opened -> no canonical to transact on
+      return;
+    }
+    if (isGold) {
+      // A DELTA, not an absolute. Two players trading with the same merchant at once would
+      // each compute a different absolute from their own stale view and the later write would
+      // erase the earlier trade; deltas commute, so both land.
+      const before = cont.gold ?? 0;
+      const after = Math.max(0, before + (goldDelta ?? 0));
+      cont.gold = after;
+      cont.stateSeq += 1;
+      this.cells.markDirty(cellKey);
+      reply(true, undefined, cont.stateSeq);
+      this.relayCellExcept(cellKey, player.id, 'ContainerUpdate', {
+        ...objRefToJs(ref), gold: after, stateSeq: cont.stateSeq,
+      });
+      log('debug', 'world.merchant_gold', { by: player.name, before, after, cellKey });
+      return;
+    }
+    // Past the gold branch this is take/put, so both are present -- but the validation above is
+    // now a disjunction and no longer narrows them for the compiler. Re-assert rather than
+    // cast: a cast would also silence a REAL regression here later.
+    if (!itemId || n === undefined) {
+      this.invalid(player, 'ContainerOpRequest');
       return;
     }
     if (op === 'put' && this.contained(player)) {
