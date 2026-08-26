@@ -244,6 +244,19 @@ Fixture faults fixed on the way, none of them the product: the world had to be n
 `--idle-reap-ms 4000` was shorter than a client boot, so the world was reaped ONE SECOND
 before the player finished arriving -- the scenario was racing its own fixture.
 
+#### OPEN, small but real: a Public press can be silently lost
+
+Found while stabilising `s57`, which passed alone and failed in a full run. The client's own
+mirror says where it stops: `publicStage` reaches `asked` and never advances. `where:public`
+asks the server for a world list and switches when the answer names an up public world --
+`asked` -> `list:<n>` -> `resolved:<url>`. Under load the request goes out and the answer does
+not come back, so nothing switches and the player simply stays put.
+
+To a player that is indistinguishable from a button that does nothing. The scenario presses up
+to three times now, which is what a person would do, and logs which attempt landed -- so the
+flake is visible rather than hidden. The product side is untouched and still open: either the
+request needs a timeout and retry of its own, or the answer needs to be guaranteed.
+
 #### The notice cluster (3) -- s99 FIXED, s92 pending a build
 
 * `s92-connection-lost` -- timeout waiting for the in-game "connection lost" notice.
@@ -401,10 +414,28 @@ loot bug already fixed here.
 
 ### Systems that simply do not happen for other players
 
-* **Travel services** — silt strider, boat, guild guide. No references. A player using one
-  teleports themselves; whether the others see a sensible cell change or a player who vanished
-  and reappeared across the map is untested. Party travel exists as its own mechanism and is
-  NOT the same thing.
+* **Travel services** — silt strider, boat, guild guide. Read in the engine rather than
+  guessed at this time. The PLAYER's half is already covered, by three separate mechanisms
+  that were not built for it:
+
+  * The destination is a CELL CHANGE, which `PlayerState` already carries -- and the movement
+    envelope deliberately forgives a cell change, because "a cell change IS a teleport by
+    design (doors, travel, recall)". So arriving across the map is not flagged as cheating.
+  * Travel ADVANCES TIME, and `world.lua`'s local-jump detector turns any unexplained local
+    advance into a `WorldTimeRequest`, so everyone else's clock follows. (Before the
+    SNAP_HOURS fix this teleported their sky instead of rolling it.)
+  * The FARE pays `setGoldPool`, and `Travel` is one of the seven GUI modes now watched for
+    the shared merchant purse, so it comes out of the same trader's gold everyone else sees.
+
+  WHAT IS NOT COVERED IS FOLLOWERS. `travelwindow.cpp` calls
+  `ActionTeleport::getFollowers` and moves them with you, locally. On every other client that
+  NPC is driven by whoever holds its cell, and a teleport out of that cell is not something
+  the actor sync expresses -- so a companion who travels with you is left standing where they
+  were for everyone else.
+
+  This only became reachable now that companions follow at all (see the ActorAI entry), and
+  it is a specific case of a broader limit: ACTORS DO NOT MOVE BETWEEN CELLS in this sync.
+  Worth fixing as that general problem rather than as a travel special case.
 
 * **Crime response** — arrest, jail, fines. Bounty itself IS synced (`diffCrime`), so the number
   travels, but nothing arrests you, and what a guard does about another player's bounty is
@@ -424,10 +455,20 @@ loot bug already fixed here.
 * **Companions / followers.** No `AiFollow` handling. A recruited companion follows whoever
   recruited them on that client only. Several main-quest and expansion arcs use companions.
 
-* **Vampirism and lycanthropy.** No references at all. Both change the player's record, spells
-  and how NPCs react. Whether they even survive a rejoin is unknown -- the restore path writes
-  attributes and skills, and the vampire clock is a per-character global that Phase 4 shadows,
-  so it may work by accident. Untested either way.
+* ~~**Vampirism and lycanthropy.**~~ Both already work, and the original entry ("no references
+  at all", "whether they even survive a rejoin is unknown") was wrong on both halves.
+  Verified in the engine before writing a fix that was not needed -- the same mistake this
+  list already made once with diseases.
+
+  LYCANTHROPY is explicitly handled: form is a flag on NpcStats, so nothing generic carried
+  it, and `identity.lua` captures it with `NPC.isWerewolf` and restores it with
+  `NPC.setWerewolf`. It rides `appearance` because that is what it is, and because appearance
+  is relayed -- other players see the wolf rather than a man with a wolf's stats.
+
+  VAMPIRISM needs nothing of its own. `character.cpp` derives it from the Vampirism MAGIC
+  EFFECT magnitude, which comes from the `vampire_<clan>` ABILITY in the spell list --
+  and `snapSpells` iterates the whole spell store, abilities included. It persists by the
+  same route diseases do.
 
 * **Item repair.** Every `repair` match in the codebase is `questRepair`, the admin tool -- not
   the hammer. Condition is per-item state on a shared object.
@@ -454,26 +495,22 @@ globals, factions and bounty. Everything below is character state Morrowind has 
 does not, so it resets every time the player reconnects -- silently, and in the player's favour,
 which is why nobody reports it as a bug.
 
-* **BIRTHSIGN IS NEVER CAPTURED OR RESTORED.** The engine binding already supports it --
-  `applyChargen` takes a birthsign and applies it through `setPlayerBirthsign` -- but
-  `snapAppearance` never reads one, the doc has no field for it, and the restore's applyChargen
-  call passes race/head/hair/isMale/class/name and stops there. So a rejoined character has no
-  birthsign on their sheet. The ABILITIES partly survive by accident, because snapSpells
-  captures them as spells, which is also why they were stacking before the attribute-climb fix.
-  The engine half is done; this is a three-field change on the client and the doc.
+* ~~**Birthsign is never captured or restored.**~~ FIXED. `identity.lua` reads it with
+  `types.Player.getBirthSign(self)` and the restore applies it through `applyChargen`, which
+  already took one. Previously a rejoined character had no birthsign on their sheet, and its
+  abilities survived only by accident because `snapSpells` captured them as spells -- which is
+  also why they stacked before the attribute-climb fix.
 
-* **Item condition is not persisted.** `inventory` is `{ id, n }` -- record id and count, nothing
-  else -- and the restore recreates items with `world.createObject(recordId)`, which yields a
-  FRESH object. Every relog therefore fully repairs every weapon and every piece of armour. Free,
-  unlimited, and invisible.
+* ~~**Item condition, enchantment charge and soul gems are not persisted.**~~ FIXED together,
+  because they were one gap: `inventory` was `{ id, n }` and the restore recreated items with
+  `world.createObject(recordId)`, which yields a FRESH object. Every relog fully repaired every
+  weapon and every piece of armour, recharged every enchantment, and emptied every soul gem --
+  free, unlimited and invisible, and the last of those breaks enchanting outright, which is the
+  entire point of trapping souls.
 
-* **Enchantment charge is not persisted either**, for the same reason: a drained enchanted item
-  comes back at full charge. Free recharge on demand, which also makes soul gems and the
-  Recharge mechanic pointless.
-
-* **Soul gems lose their souls.** `{ id, n }` cannot express which soul a gem holds, so a filled
-  grand soul gem returns as an empty one. Directly breaks enchanting, which is the entire point
-  of trapping souls.
+  `itemState(item)` now reads `itemData.condition`, `itemData.enchantmentCharge` and
+  `itemData.soul`, and `snapInventory` returns `{ items, itemStates }` so the shape stays
+  backward compatible with docs that predate it.
 
 * **Active magic effects are not persisted** -- no `activeSpells` field in the doc. The scope of
   this is MUCH narrower than first written here, and the original entry was wrong:
