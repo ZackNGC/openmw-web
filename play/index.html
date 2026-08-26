@@ -2798,7 +2798,9 @@
                 content.forEach(function(c){ cfg.push('content='+c); });
               }
               if (window.__omwMPEnabled) cfg.push('content=mp.omwscripts'); // ?mp= (M0 multiplayer)
-              if (wantMovies)
+              // Curated pack: no intro movies. The v1.1.0 engine deadlocks if a streamed .bik is
+              // skipped mid-playback (repro: tools/boottest/skiptest.js), and everyone skips.
+              if (wantMovies && !momwLocal)
                 cfg.push('fallback=Movies_Company_Logo,bethesda logo.bik',
                          'fallback=Movies_Morrowind_Logo,mw_logo.bik',
                          'fallback=Movies_New_Game,mw_intro.bik');
@@ -3025,7 +3027,9 @@
                 lo.content.forEach(function(c){ cfg.push('content='+c); });
               }
               if (window.__omwMPEnabled) cfg.push('content=mp.omwscripts'); // ?mp= (M0 multiplayer)
-              if (!window.__noMovies)
+              // Curated pack: no intro movies. The v1.1.0 engine deadlocks if a streamed .bik is
+              // skipped mid-playback (repro: tools/boottest/skiptest.js), and everyone skips.
+              if (!window.__noMovies && !mc)
                 cfg.push('fallback=Movies_Company_Logo,bethesda logo.bik',
                          'fallback=Movies_Morrowind_Logo,mw_logo.bik',
                          'fallback=Movies_New_Game,mw_intro.bik');
