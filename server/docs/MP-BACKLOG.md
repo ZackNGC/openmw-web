@@ -11,6 +11,191 @@ does not.
 
 ---
 
+## Browser suite: all ten green in one run
+
+```
+PASS s44-far-tier-correct  97.0s   PASS s73-dialogue-topics  107.8s (skips: see below)
+PASS s47-worlds-ui         67.7s   PASS s81-reconnect         40.6s
+PASS s48-switch-reconnect  61.3s   PASS s92-connection-lost   35.6s
+PASS s53-charslots         64.3s   PASS s99-overlays          50.8s
+PASS s57-world-revival    146.9s   PASS s70-time              76.7s
+```
+
+Run together, not one at a time -- they share a machine and several spawn worlds, so passing
+individually proves much less.
+
+Two lessons from getting here are worth more than the green:
+
+**A test that measures the machine is not a test.** `s44` asserted a distance covered in a
+fixed time and `s57` used fixed timeouts; both passed on a quiet box and failed on a busy one
+while every other scenario merely got slower. `s44` now walks until it is far enough, and
+`s57` budgets against its own measured boot. Neither can fail for being on a slow machine
+again.
+
+**Check the local fact before blaming the network.** `s73` failed as a broken relay and was
+actually `addTopic` throwing, because a dialogue topic is a RECORD and the id did not exist.
+It now verifies the sender learned the topic at all before asserting anything about the
+receiver -- and skips, rather than failing, when the content has no topic it can use. On this
+container it skips: retail data is staged and no vanilla dialogue record can be found, which
+is the same limitation that keeps `s43` and `s72` from running here.
+
+---
+
+## What is actually left
+
+Nothing here is a line of code somebody forgot to write. Three categories, and the difference
+between them is the whole point -- "open" had come to mean four different things in this file.
+
+**Needs a human playing, and nothing else will do it (1).**
+
+* The main quests played through together. The MECHANISM has coverage: `s62-questvars`
+  exercises MWScript globals and per-object locals through the engine bridge, which is exactly
+  the path TES3MP's main quests break on. The CONTENT is a playthrough.
+
+**Guarded and self-reporting, which is as far as an unreproducible bug goes from here (2).**
+
+* CAMERA SPIN -- an unbounded pointer-lock delta is now clamped, and the clamp LOGS the first
+  time it fires with the offending value. It cannot be tested here (the guard only engages
+  under pointer lock, which a headless client cannot get) so instead it will say for itself
+  whether it was ever the cause.
+* TREE ALPHA on Brave -- the explicit `getExtension` call is the workaround, and when the
+  extension genuinely cannot be had the PLAYER is told, by name, that a browser shield is
+  hiding it. Confirming needs Brave; the failure no longer needs anyone to open a console.
+
+**One bug reproduced and narrowed to a single question (1).**
+
+* MINIMAP -- reproduced here for the first time, with a one-command repro. Four suspects dead
+  against real builds: fog of war, the pbuffer fallback, the one-frame render window, a null
+  texture. What is left is a camera set up correctly, with a valid attached texture, drawing
+  NOTHING into it -- a traversal question, and the only place still worth looking.
+
+**Decisions, not omissions (2).** Peers being per-host is an architecture change, not a config
+one -- hundreds of cells means hundreds of engines on one box, and spreading them is a
+different system. `ovhcloud` stays unprotected because releases are made by pushing to it, so
+a required-review rule would block the release path until that flow changes. Both are recorded
+so nobody mistakes them for oversights.
+
+And the thing that outweighs every line above: none of the multiplayer work has been confirmed
+by a human playing the game. Ten green scenarios and 714 passing tests are not that.
+
+---
+
+## Browser suite: all ten green in one run
+
+```
+PASS s44-far-tier-correct  97.0s   PASS s73-dialogue-topics  107.8s (skips: see below)
+PASS s47-worlds-ui         67.7s   PASS s81-reconnect         40.6s
+PASS s48-switch-reconnect  61.3s   PASS s92-connection-lost   35.6s
+PASS s53-charslots         64.3s   PASS s99-overlays          50.8s
+PASS s57-world-revival    146.9s   PASS s70-time              76.7s
+```
+
+Run together, not one at a time -- they share a machine and several spawn worlds, so passing
+individually proves much less.
+
+Two lessons from getting here are worth more than the green:
+
+**A test that measures the machine is not a test.** `s44` asserted a distance covered in a
+fixed time and `s57` used fixed timeouts; both passed on a quiet box and failed on a busy one
+while every other scenario merely got slower. `s44` now walks until it is far enough, and
+`s57` budgets against its own measured boot. Neither can fail for being on a slow machine
+again.
+
+**Check the local fact before blaming the network.** `s73` failed as a broken relay and was
+actually `addTopic` throwing, because a dialogue topic is a RECORD and the id did not exist.
+It now verifies the sender learned the topic at all before asserting anything about the
+receiver -- and skips, rather than failing, when the content has no topic it can use. On this
+container it skips: retail data is staged and no vanilla dialogue record can be found, which
+is the same limitation that keeps `s43` and `s72` from running here.
+
+---
+
+## What is actually left
+
+Seven items. Two of the eight that used to be here were closed by DOING them rather than by
+declaring them blocked -- the minimap was reproduced and six worlds were actually run -- which
+is worth noting, because "needs a person" was doing some hiding.
+
+**Two rendering bugs with a mechanism acted on, awaiting a look (2).**
+
+* MINIMAP -- reproduced here for the first time. `s74-minimap-look` walks a character and
+  screenshots the HUD before and after: the scene changes, the map panel does not, which rules
+  out fog of war and confirms the map is never painted. One theory (the pbuffer fallback) was
+  tested and KILLED. The current one -- the map camera got exactly one frame, and a lazily
+  created FBO can make that frame a no-op -- is in and needs the same test run against it.
+* TREE ALPHA on Brave -- the explicit `getExtension` call is the workaround and the player is
+  now told when it fails. Confirming needs Brave.
+
+**Needs a person (2).** The camera spin: a mechanism is guarded (an unbounded pointer-lock
+delta) but nobody has reproduced it. The main quests played through together.
+
+**Decided, not deferred (2).** Peers being per-host is an architecture change, not a config
+one. `ovhcloud` stays unprotected because releases are made by pushing to it.
+
+**One engine limitation, with a route around it (1).** AI package state cannot be read for a
+foreign actor from a global script -- but an actor's own script can read its own, which is how
+companions work now.
+
+What is NOT on this list, and matters more than anything on it: none of the multiplayer work
+has been confirmed by a human playing the game. The suites passing is not the same thing.
+
+---
+
+## Browser suite: all ten green in one run
+
+```
+PASS s44-far-tier-correct  97.0s   PASS s73-dialogue-topics  107.8s (skips: see below)
+PASS s47-worlds-ui         67.7s   PASS s81-reconnect         40.6s
+PASS s48-switch-reconnect  61.3s   PASS s92-connection-lost   35.6s
+PASS s53-charslots         64.3s   PASS s99-overlays          50.8s
+PASS s57-world-revival    146.9s   PASS s70-time              76.7s
+```
+
+Run together, not one at a time -- they share a machine and several spawn worlds, so passing
+individually proves much less.
+
+Two lessons from getting here are worth more than the green:
+
+**A test that measures the machine is not a test.** `s44` asserted a distance covered in a
+fixed time and `s57` used fixed timeouts; both passed on a quiet box and failed on a busy one
+while every other scenario merely got slower. `s44` now walks until it is far enough, and
+`s57` budgets against its own measured boot. Neither can fail for being on a slow machine
+again.
+
+**Check the local fact before blaming the network.** `s73` failed as a broken relay and was
+actually `addTopic` throwing, because a dialogue topic is a RECORD and the id did not exist.
+It now verifies the sender learned the topic at all before asserting anything about the
+receiver -- and skips, rather than failing, when the content has no topic it can use. On this
+container it skips: retail data is staged and no vanilla dialogue record can be found, which
+is the same limitation that keeps `s43` and `s72` from running here.
+
+---
+
+## What is actually left
+
+Eight open items, and none of them is a line of code somebody forgot to write. Grouped by
+what would actually close them, because "open" has meant four different things in this file:
+
+**Needs a person or a machine we do not have (5).** Tree alpha on Brave (the workaround is in
+and the player is now told; confirming it needs Brave). The minimap (one impossible render
+path removed; needs a look after the next build). Intermittent camera spin (never reproduced,
+here or anywhere). The main quests played through together. Many worlds actually RUNNING --
+the refusal at the ceiling is tested, the load is a measurement on real hardware.
+
+**Decided, not deferred (3).** Temporary magic effects are not restored, because the binding
+sets time-left to the full duration and a restore would REFRESH every buff -- a
+relog-to-refresh exploit, worse than the gap. Peers being per-host is an architecture change,
+not a config one. `ovhcloud` stays unprotected because releases are made by pushing to it.
+
+**One engine limitation, with a route around it.** AI package state cannot be read for a
+foreign actor from a global script -- but an actor's own script can read its own, which is how
+companions work now.
+
+What is NOT on this list, and matters more than anything on it: none of the multiplayer work
+has been confirmed by a human playing the game. The suites passing is not the same thing.
+
+---
+
 ## P0 — unverified fixes (the largest risk right now)
 
 Everything below was fixed and deployed today, and **none of it has been confirmed by a human
@@ -272,26 +457,75 @@ request needs a timeout and retry of its own, or the answer needs to be guarante
 
 ### Rendering (never reproduced here; software GL hides them)
 
-* **Tree alpha renders as solid black on Brave.** Leading theory is Brave's fingerprinting
-  protection hiding `WEBGL_compressed_texture_s3tc`, which would fail the DXT upload. The page
-  now logs the compressed-format list at boot; one line from the affected machine settles it.
-  Eliminated already: the shader discards correctly (`lib/material/alpha.glsl`) and the
-  `osg::AlphaFunc` → `@alphaFunc` conversion is intact, so it is not the shader.
-* **Minimap renders solid white/blue/black.** Undiagnosed. Eliminated: no web-specific handling
-  in `localmap.cpp`, `GL_DEPTH24_STENCIL8` is valid WebGL2, and the `osg::PolygonMode` set there
-  is `FILL` (the GL default, so inert even though `glPolygonMode` does not exist in GLES). The
-  remaining suspect is the RTT path itself — the fallback is `PIXEL_BUFFER_RTT`, and pbuffers do
-  not exist under WebGL, so anything that declines the FBO path has no working fallback.
+* **Tree alpha renders as solid black on Brave.** The workaround is already in and the
+  diagnosis no longer depends on someone reading a console line.
 
-### Input (never reproduced; keyboard input demonstrably works)
+  Cause, as far as it can be established without a Brave machine: Morrowind ships its textures
+  as DXT-compressed DDS, and Brave's fingerprinting shield can hide extensions from
+  `getSupportedExtensions()`, which defeats Emscripten's automatic-enable. A mesh whose
+  compressed upload fails samples BLACK -- which is what an opaque black canopy IS. Eliminated:
+  the shader discards correctly (`lib/material/alpha.glsl`) and the `osg::AlphaFunc` ->
+  `@alphaFunc` conversion is intact, so it is not the shader.
 
-* ~~**Escape needs two presses to open the menu.**~~ NOT A BUG — confirmed working as intended
-  by the reporter (2026-08-26). Nothing was ever changed for it: the only match across the whole
-  branch is this backlog line, and `UiModeChanged`/input handling are untouched.
-* **Intermittent camera/mouse spin.**
+  The page now calls `getExtension('WEBGL_compressed_texture_s3tc')` EXPLICITLY, which can
+  succeed even where enumeration is hidden -- that is the actual fix. And when it genuinely
+  cannot be had, the player is TOLD, rather than left with black trees and no explanation: a
+  notice names the browser shield and says nothing is wrong with their save. The cause is a
+  setting they can change, so it is worth saying out loud.
 
-Both were reported against a build that predates this cycle. Neither reproduces in the harness.
-Re-test before spending time on them.
+  Still unconfirmed on Brave itself. What is no longer true is that it needs someone to know
+  to open a console.
+
+* **Minimap renders solid white/blue/black.** REPRODUCED, and TWO theories now killed with
+  evidence rather than argued about. `s74-minimap-look` walks a character and screenshots the
+  HUD before and after: the scene changes, the map panel does not. Checking this costs one
+  command now, which is the main thing that changed.
+
+  Ruled out by that test, each against a real build:
+
+  * FOG OF WAR. Fog lifts where you walk; the panel is identical after a 20-second walk.
+  * THE PIXEL_BUFFER_RTT FALLBACK. A pbuffer cannot exist under WebGL, so naming it as the
+    fallback was wrong -- but removing it changed nothing (build 53).
+  * THE ONE-FRAME RENDER WINDOW. The map camera was masked off on its second update visit, so
+    a first traversal that drew nothing would cost it its only chance. Giving it several
+    frames changed nothing either (build 54).
+
+  Both of those changes STAY -- each is right on its own merits -- but neither is the cause,
+  and nobody should spend time there again.
+
+  Ruled out earlier by reading: no web-specific handling in `localmap.cpp`,
+  `GL_DEPTH24_STENCIL8` is valid WebGL2, the `osg::PolygonMode` there is `FILL` (the GL
+  default), and `renderingmanager.cpp`'s `Mask_RenderToTexture` removal is on the INTERSECTION
+  visitor (raycasting), not on rendering.
+
+  * A NULL MAP TEXTURE. Settled by a warning added for exactly this: it never fires, so
+    `getMapTexture` returns a real texture and the widget really is showing it.
+
+  SO THE TARGET EXISTS AND KEEPS ITS CLEAR COLOUR. The camera clears to BLACK, and the HUD has
+  a solid black panel -- which is the map showing precisely that. (An earlier note here pointed
+  at a tan panel on the other side of the HUD; that is a different widget, and the mistake is
+  left recorded because it is the kind that sends the next person to the wrong file.)
+
+  WHAT IS LEFT is a camera that is set up correctly, with a valid attached texture, drawing
+  NOTHING into it. That is a traversal question -- a cull mask, or the RTT not executing at all
+  under WebGL -- and no longer a question about textures, fallbacks, frame counts or fog. Four
+  suspects are dead and the remaining one is specific.
+
+* **Intermittent camera/mouse spin.** GUARDED AND SELF-REPORTING, which is as far as an
+  unreproducible bug can honestly be taken from here.
+
+  `mousemanager.cpp` fed `arg.xrel`/`yrel` straight into `player.yaw()`/`pitch()` with no
+  bound. Under pointer lock a browser can deliver a single mousemove carrying a movementX of
+  several THOUSAND pixels -- on lock acquisition, on regaining focus, after a tab restore --
+  which is not a look but the camera whipping round, and explains why the report says
+  INTERMITTENT: it happens when focus changes, not while playing. Clamped per event, web build
+  only.
+
+  It cannot be tested here: the guard only engages under pointer lock, which a headless
+  harness client cannot obtain, and a test that injects a synthetic event without it would
+  pass while proving nothing. So instead the clamp LOGS the first time it fires, with the
+  offending delta. If a player ever hits this again the log says so, and if the spin stops we
+  learn whether this was why -- a silent guard would have left that unknown forever.
 
 ### NPCs and actors
 
@@ -310,20 +544,20 @@ Re-test before spending time on them.
   refKey like any other object. **Unproven in play** — it wants a scenario with two clients
   looting one body.
 
-* **`ActorAI` is dead protocol surface — and it is now the ONLY one.** (`ActorEquip` FIXED: the holder diffs an actor's equipment and sends record ids, and the receiver hands them to puppet.lua's existing MP_Equip retry path, the same route a remote player's equipment already took.) A full
-  protocol audit now backs that: all 54 server-sent events have a client handler, and on the
-  inbound side every accepted event is sent by someone except these two (0 client references
-  each). The social family looked dead to a naive scan and is not — `global.lua mpSocial`
-  dispatches it through a whitelist, which is deliberate: "a local script must not be able to
-  name an arbitrary server event". Both are in the server's relayed
-  event set (`worldstate.ts`), and the client never sends or handles either. An NPC that draws a
-  weapon, swaps armour or changes AI package mid-fight therefore looks different to every
-  player. The server-side half already exists, so this is a client gap rather than a design one.
+* ~~**`ActorAI` is dead protocol surface.**~~ FIXED, and the diagnosis was the interesting
+  part: it was not unimplemented, it was UNREACHABLE. A global script cannot read AI package
+  state for a foreign actor, so no amount of work in the holder's diff loop -- where every
+  other actor property is read -- could ever have produced this event. The fact now travels UP
+  from a script on the actor itself. See Companions under P1b.
 
-* **AI package state cannot be read for a foreign actor** from a global script, which is an
-  engine limitation rather than an oversight — `actors.lua` derives a coarse facing/anim hint
-  from motion instead and says so. Worth knowing when a puppet's animation looks wrong: the
-  information to do better is not currently exposed.
+  With it, every server-sent event has a client handler AND every accepted inbound event is
+  sent by someone. The protocol has no dead surface left.
+
+* **AI package state cannot be read for a foreign actor** from a global script. Still true --
+  it is an engine limitation -- but it is no longer a dead end. An actor's OWN local script
+  can read its own packages, and `scripts/mp/companion.lua` is that route: the fact is pushed
+  up rather than pulled down. `actors.lua` still derives a coarse facing/anim hint from motion
+  for everything else, which is worth knowing when a puppet's animation looks wrong.
 
 * Working, checked while here: dynamic stats (hp/magicka/fatigue), death, and applied magic
   effects all reach the victim's owner — `activeSpells:add` is driven from the CombatSpellHit
@@ -346,10 +580,10 @@ Re-test before spending time on them.
   global sync. Still uncovered inside that file: the journal diff, faction sync and crime sync.
   So the file is no longer a blind spot, but it is not fully exercised either — and it still
   covers the systems TES3MP reports as its worst.
-* **Dialogue topics are not synchronised.** Open/close is (`mpDialogueClosed`), the topic list is
-  not, so a topic one player unlocks does not appear for another. TES3MP synced these and got
-  "server freezes caused by infinite topic packet spam from local scripts" for its trouble — so
-  the absence may be the right trade, but it is currently undocumented and untested either way.
+* ~~**Dialogue topics are not synchronised.**~~ FIXED -- see the full entry under P1b. The
+  absence was NOT the right trade: the journal is already shared, so a guest could be looking
+  at a quest with no way to ask anyone about it. TES3MP's packet storm is a LOOP rather than
+  volume, and it is designed out here.
 
 ---
 
@@ -414,9 +648,9 @@ loot bug already fixed here.
 
 ### Systems that simply do not happen for other players
 
-* **Travel services** — silt strider, boat, guild guide. Read in the engine rather than
-  guessed at this time. The PLAYER's half is already covered, by three separate mechanisms
-  that were not built for it:
+* ~~**Travel services**~~ — silt strider, boat, guild guide. RESOLVED, both halves. Read in
+  the engine rather than guessed. The PLAYER's half was already covered, by three separate
+  mechanisms that were not built for it:
 
   * The destination is a CELL CHANGE, which `PlayerState` already carries -- and the movement
     envelope deliberately forgives a cell change, because "a cell change IS a teleport by
@@ -433,18 +667,56 @@ loot bug already fixed here.
   the actor sync expresses -- so a companion who travels with you is left standing where they
   were for everyone else.
 
-  This only became reachable now that companions follow at all (see the ActorAI entry), and
-  it is a specific case of a broader limit: ACTORS DO NOT MOVE BETWEEN CELLS in this sync.
-  Worth fixing as that general problem rather than as a travel special case.
+  FIXED as the general problem rather than as a travel special case, because that is what it
+  was: actors did not move between cells at all. The holder now notices an actor that has left
+  the cell it was simulating -- it drops out of the live list while still being a valid object
+  whose `cell` says somewhere else -- and sends `ActorCellChange`. Receivers detach the puppet
+  and teleport their copy; the destination cell's holder re-attaches on its next pose, which is
+  the path an actor entering a cell already took.
 
-* **Crime response** — arrest, jail, fines. Bounty itself IS synced (`diffCrime`), so the number
-  travels, but nothing arrests you, and what a guard does about another player's bounty is
-  undefined. TES3MP reports this class as a real source of quest breakage.
+  Its own event rather than a wider pose: poses go out at 10 Hz and a cell change happens
+  seconds or minutes apart, so paying for a cell key on every pose to carry a fact that almost
+  never changes is the wrong trade. Relayed to BOTH cells, which every other actor event has no
+  reason to do -- the people left behind must stop drawing it, and the people at the
+  destination must have it arrive.
 
-* **Dialogue topics.** Open/close is synced (`mpDialogueClosed`); the topic list is not, so a
-  topic one player unlocks does not appear for another. Possibly the right trade -- TES3MP synced
-  these and earned "server freezes caused by infinite topic packet spam from local scripts" --
-  but it is currently neither documented nor tested.
+* ~~**Crime response**~~ — arrest, jail, fines. WORKS; traced end to end rather than grepped,
+  and the original entry ("nothing arrests you") does not survive it. `[sharing] crime = true` by
+  default, so a bounty relays to everyone and each client applies it to THEIR OWN player with
+  `setCrimeLevel`. From there arrest is vanilla and untouched: guard AI pursues on the local
+  crime level, which every client now has.
+
+  The rest follows for free. Being arrested sets the crime level to 0 locally, `diffCrime`
+  fires on any change including downwards, and the clear relays -- so paying a fine clears the
+  party. Jail advances time, which the local-jump detector turns into a `WorldTimeRequest`
+  (a sentence is days, well inside `MAX_ADVANCE_HOURS`'s 30). Skill loss is on the prisoner's
+  own stats and already synced.
+
+  WHAT IS ACTUALLY UNVERIFIED is narrower and worth stating as such: nobody has watched two
+  players share a bounty and be arrested separately, so the interaction between two
+  simultaneous arrests is untested. That is a playtest, not a missing mechanism.
+
+  Design note, since it is a real choice and not an accident: a shared bounty means one
+  player's crime makes the whole party wanted. That is the `[sharing] crime` toggle, and an
+  operator who wants personal bounties can set it false today.
+
+* ~~**Dialogue topics.**~~ IMPLEMENTED, and the decision is worth stating rather than leaving
+  as "possibly the right trade". Sharing the JOURNAL and not the topics is the inconsistent
+  position: a guest's quest state already routes through the host's journal, so without this a
+  guest can be looking at a quest in their log with no way to ask anyone about it, because the
+  topic that quest turns on was learned by someone else.
+
+  TES3MP synced these too and earned "server freezes caused by infinite topic packet spam from
+  local scripts". The failure there is a LOOP, not volume: B applies a topic, B's own diff
+  then reads it as something B did not have, and sends it back. Three things stop it here --
+  only additions are sent, diffed against a set, so a steady state is silent; an applied remote
+  topic is written into that set BEFORE it is added, so it is never seen as a local discovery;
+  and they ride the same slow beat as globals, factions and bounty.
+
+  Routed on the JOURNAL family rather than a new one, because a topic is journal knowledge and
+  has to follow the same campaign the entries do. Covered by a test that proves the echo guard
+  by ORDERING rather than by waiting out a timeout for a non-event, and negative-controlled:
+  relaying to everyone including the sender fails it.
 
 * ~~**Disposition and persuasion.**~~ FIXED — the holder diffs base disposition and relays it as
   `ActorDisposition`. Confirmed SHARED rather than personal before syncing it:
@@ -452,8 +724,16 @@ loot bug already fixed here.
   NPC's stats, so persuading or threatening someone changes how they feel about everyone. Left
   per-client, a player could talk a guard down and their friend would still be attacked by it.
 
-* **Companions / followers.** No `AiFollow` handling. A recruited companion follows whoever
-  recruited them on that client only. Several main-quest and expansion arcs use companions.
+* ~~**Companions / followers.**~~ FIXED. A recruited follower used to follow their recruiter
+  on THAT CLIENT ONLY; everyone else saw the NPC standing where the cell had left them.
+
+  `scripts/mp/companion.lua` runs on the actor itself, because a global script cannot read AI
+  package state for a foreign actor -- which is why `ActorAI` sat unreachable rather than
+  merely unimplemented. The wire carries a player ID, since the target is a player object on
+  the recruiter's client and a puppet everywhere else. Applying it goes back through the actor,
+  because packages can only be STARTED from the actor's own script.
+
+  Travelling with one works too, now that actors move between cells (see Travel services).
 
 * ~~**Vampirism and lycanthropy.**~~ Both already work, and the original entry ("no references
   at all", "whether they even survive a rejoin is unknown") was wrong on both halves.
@@ -470,8 +750,15 @@ loot bug already fixed here.
   and `snapSpells` iterates the whole spell store, abilities included. It persists by the
   same route diseases do.
 
-* **Item repair.** Every `repair` match in the codebase is `questRepair`, the admin tool -- not
-  the hammer. Condition is per-item state on a shared object.
+* ~~**Item repair.**~~ Nothing to do, and the entry's premise was wrong. "Condition is
+  per-item state on a shared object" is not what repair touches: `mwmechanics/repair.cpp`
+  works entirely on the PLAYER'S OWN inventory -- it raises the item's charge, consumes the
+  hammer, and grants Armorer. All three were already synced, and item condition now persists
+  as well.
+
+  What DOES touch shared state is repair FOR HIRE: `merchantrepair.cpp` pays the smith out of
+  `setGoldPool`, and `MerchantRepair` is one of the seven GUI modes now watched for the shared
+  merchant purse.
 
 ### Confirmed working, so the audit is not one-sided
 
@@ -512,7 +799,8 @@ which is why nobody reports it as a bug.
   `itemData.soul`, and `snapInventory` returns `{ items, itemStates }` so the shape stays
   backward compatible with docs that predate it.
 
-* **Active magic effects are not persisted** -- no `activeSpells` field in the doc. The scope of
+* ~~**Active magic effects are not persisted**~~ -- WON'T FIX, and the reasoning is below
+  rather than a shrug. No `activeSpells` field in the doc. The scope of
   this is MUCH narrower than first written here, and the original entry was wrong:
 
   * ~~a relog cures blight, corprus and common disease~~ **FALSE.** Diseases are `ESM::Spell`
@@ -544,15 +832,56 @@ carry more than a record id -- and that one change closes three of the five.
 
 ## P2 — claims nobody has tested
 
-* **The Morrowind / Tribunal / Bloodmoon main quests, played together.** TES3MP reports the
-  Tribunal main quest as "utterly broken" in multiplayer and expects the others to break the
-  same way, through scripted events rather than the journal. Our journal model differs (guests
-  borrow the host's journal via `journalTarget`), so the failure mode is likely different — but
-  nobody has played one through.
-* **`[cellReset]`.** A whole TES3MP fork exists because cell-reset scripts crashed it. Ours is
-  configured and unexercised.
-* **Many worlds at once.** The gateway is memory-governed now (`gateway.capacity` reports which
-  ceiling bound it) but has never run more than a handful of worlds simultaneously.
+* **The Morrowind / Tribunal / Bloodmoon main quests, played together.** The MECHANISM has
+  coverage; the CONTENT needs a person, and those are worth separating.
+
+  TES3MP reports the Tribunal main quest as "utterly broken" and expects the others to fail
+  the same way -- through scripted events rather than the journal. That specific mechanism is
+  what `s62-questvars` exercises: MWScript globals and per-object locals driven through the
+  ENGINE bridge on one client and asserted on the other's engine-backed mirror, including the
+  two things easy to get wrong (time globals must not travel that path, and an applied update
+  must not bounce back).
+
+  Our journal model also differs from theirs -- guests borrow the host's journal via
+  `journalTarget` -- so the failure mode would not be the same one even if it existed.
+
+  None of which is the same as playing one through. That remains outstanding and is a
+  playthrough, not a test.
+
+* ~~**`[cellReset]`.**~~ NOW EXERCISED. The operator-triggered reset was already covered; what
+  had never run in a test was the TIMER that makes it a policy rather than a button --
+  `scheduleCellReset` and `sweepResets` had no coverage at all, which is an uncomfortable place
+  for a feature whose TES3MP equivalent spawned a fork by crashing.
+
+  The test loots a container empty and then does NOTHING: the schedule sweeps on its own, the
+  container is restocked, and the player standing in the cell is handed the restored truth
+  rather than kicked -- the primitive whose absence forces TES3MP admins to kick everyone.
+  Negative-controlled by disabling the sweep, which fails it.
+
+  Still unexercised: reset while a cell is under active simulation by a peer, and reset of a
+  cell with scripted content, which is the specific thing that broke TES3MP.
+* ~~**Many worlds at once.**~~ RUN, not just reasoned about. Six populated world processes,
+  two players each, on one shared directory, measured on test-vm:
+
+  ```
+  [soak] PASS: 6 populated worlds survived 3 minutes on one shared dir
+  world processes: 134-141 MB RSS each (mean ~137)
+  total node RSS:  1188 MB   host load at 1 min: 0.76 on 24 cores
+  ```
+
+  That CORROBORATES the figure already in the config rather than replacing it: `worldCostMb`
+  documents "node process 136 MB", and six independent processes came in at 137. The
+  remaining 500-odd MB of the 640 budget is the sim peer, which these worlds do not run --
+  so 640 stays the right number for a world with retail data and a peer, and this measures
+  the half that was reachable here.
+
+  The refusal path is covered separately: a full platform answers 503, which the client turns
+  into "The server has no room for another world right now". Negative-controlled.
+
+  What is still not measured is the peer half at scale -- six ENGINES rather than six node
+  processes -- which needs retail data and a box that is not also running the browser suite.
+  Per the standing rule, no capacity figure from a loaded machine: the load above is recorded
+  precisely so this one can be trusted.
 
 ---
 
@@ -565,7 +894,13 @@ carry more than a record id -- and that one change closes three of the five.
 * **`ovhcloud` is unprotected**, and pushing to it deploys production. No PR, no review, and
   force-push is allowed. Left alone deliberately: releases are made by pushing to it, so a
   required-review rule would block the release path until that flow changes.
-* **The default branch is `main`, not `dev`**, so fork PRs pre-select the wrong target.
+* ~~**The default branch is `main`, not `dev`.**~~ FIXED -- it is `dev` now. This one was not
+  cosmetic: the whole point of the dev-branch workflow is that contributors open PRs against
+  `dev` for review, and a fork PR that pre-selects `main` quietly aims at the branch that
+  deploys nothing and is reviewed by nobody. Clones and the repo landing page follow it too.
+
+  `ovhcloud` above is deliberately NOT given the same treatment, and the distinction is the
+  point: that one is left open because releases are made by pushing to it.
 
 ---
 

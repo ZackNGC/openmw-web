@@ -82,10 +82,26 @@ export default async function run(ctx) {
   // ownId is the world this scenario later reaps and dials back into. It HAS to be the
   // player own world: `where:solo` returns them there, so a separate one would send them
   // somewhere that was never reaped and the revival round trip would never be exercised.
+  // MEASURE THE BOX, THEN BUDGET AGAINST IT. Every wait in this scenario is really "how long
+  // does an engine take to boot here", because a world switch reloads the page and boots it
+  // again -- and this is the only scenario that does that THREE times. Fixed numbers were
+  // wrong in both directions: 240s passed on a quiet box and failed at 291s on a busy one,
+  // then 420s failed at 475s. There is no constant that is both generous enough for the
+  // slowest machine and honest on the fastest.
+  //
+  // The first boot is the measurement: launchClient does not return until the client is
+  // Joined, so the wall time of this call IS a boot-and-join on this machine right now.
+  const bootStart = Date.now();
   const gw = await startGatewayAndClient(ctx, {
     gwPort: GW_PORT, idleReapMs: REAP_MS, ownId: OWN_ID,
   });
   const a = gw.client;
+  // A generous multiple, not a tight one: a reboot competes with whatever made the first boot
+  // slow, and the floor keeps a suspiciously fast first boot from setting an unusable budget.
+  const bootMs = Date.now() - bootStart;
+  const ARRIVE_MS = Math.max(180_000, bootMs * 8);
+  ctx.log(`  first boot took ${(bootMs / 1000).toFixed(1)}s; allowing `
+    + `${(ARRIVE_MS / 1000).toFixed(0)}s per arrival after a switch`);
   const stopGw = gw.stop;
   const acct = a.name.toLowerCase();
   try {
@@ -106,7 +122,7 @@ export default async function run(ctx) {
     // `up`, not a port: the gateway publishes no world ports, so the old `ownPort = w.port`
     // captured undefined and then failed its own `> 0` check the instant the world came up.
     let ownUp = false;
-    const upBy = Date.now() + 60_000;
+    const upBy = Date.now() + ARRIVE_MS;
     while (Date.now() < upBy) {
       const w = (await worldsOf(acct)).find((x) => x.id === 'priv-revivetest');
       if (w?.up) { ownUp = true; break; }
@@ -125,7 +141,7 @@ export default async function run(ctx) {
     await a.eval("Module.__omwMPCmd='worldjoin:priv-revivetest'");
 
     let joined = false;
-    const joinBy = Date.now() + 60_000;
+    const joinBy = Date.now() + ARRIVE_MS;
     while (Date.now() < joinBy) {
       if (await playersIn('priv-revivetest') > 0) { joined = true; break; }
       await ctx.sleep(1000);
@@ -165,15 +181,26 @@ export default async function run(ctx) {
     // reloads, never landing. Re-press only from `asked`; after that, wait it out.
     let inPublic = false;
     let lastStage = '(never set)';
-    const publicBy = Date.now() + 240_000;
+    // BUDGETED LIKE A JOIN, because that is what it is. Arriving after a switch means the page
+    // reloads and the WHOLE ENGINE boots again -- the harness gives a first join 600s for
+    // exactly that reason, and this scenario does it three times. 240s passed in isolation and
+    // failed in a full run at 291s, which was measuring the box rather than the product.
+    const publicBy = Date.now() + ARRIVE_MS;
     let pressed = 0;
     let lastPress = 0;
     while (Date.now() < publicBy && !inPublic) {
       const inFlight = lastStage.startsWith('switchTo:') || lastStage.startsWith('resolved:');
-      if (!inFlight && Date.now() - lastPress > 20_000 && pressed < 3) {
+      if (!inFlight && Date.now() - lastPress > 30_000 && pressed < 3) {
         pressed++;
         lastPress = Date.now();
         ctx.log(`  pressing Public (attempt ${pressed}, publicStage="${lastStage}")`);
+        // RE-GRANTED IMMEDIATELY BEFORE THE PRESS, not once before the loop. The token is
+        // injected into `window` rather than carried in the URL, so it dies with any reload --
+        // and granting it before the loop meant that by the time a press actually happened the
+        // page underneath could already be a new one. Proven, not guessed: at failure the page
+        // reported switchTo cleared (so rebootIntoWorld DID run) and hasLockerToken=false (so
+        // it threw on the very first thing it checks).
+        await grantLockerSession(a, GW_PORT, gw.account);
         await a.eval("Module.__omwMPCmd='socialtab:worlds'");
         await a.eval("Module.__omwMPCmd='where:public'");
       }
@@ -183,6 +210,29 @@ export default async function run(ctx) {
       await ctx.sleep(1000);
     }
     ctx.log(`  reached public: ${inPublic} (publicStage="${lastStage}")`);
+    if (!inPublic) {
+      // THE CLIENT'S OWN ACCOUNT, restored after a refactor dropped it. Everything visible
+      // from out here says the same unhelpful thing -- the switch was issued and nobody
+      // arrived -- so the page's own state is the only place left to look. An empty log with
+      // empty mirrors means it navigated somewhere blank; a full log means it booted and could
+      // not connect. Those are different bugs.
+      // THE TWO THINGS THAT DECIDE THIS. `switchTo` still set means the page never consumed
+      // the destination Lua published; cleared means it TRIED and rebootIntoWorld threw. And a
+      // missing locker token is the most likely reason it would throw, because a switch
+      // reloads the page and the token is injected into window rather than carried in the URL.
+      const sw = await a.eval("String((window.__omwMP||{}).switchTo||'(cleared)')").catch(() => '?');
+      const tok = await a.eval("String(!!window.__omwLockerToken)").catch(() => '?');
+      const base = await a.eval("String(typeof window.__lockerHttpBase)").catch(() => '?');
+      ctx.log(`  switchTo="${sw}" hasLockerToken=${tok} lockerHttpBase=${base}`);
+      ctx.log(`  jsErrors: ${JSON.stringify(a.jsErrors?.() ?? [])}`);
+      ctx.log(`  luaErrors: ${JSON.stringify(a.luaErrors?.() ?? [])}`);
+      const where = await a.eval('String(location.href)').catch((e) => `eval failed: ${e}`);
+      const frag = await a.eval('String(window.__omwBootFrag||"(none)")').catch(() => '?');
+      ctx.log(`  page url: ${where}`);
+      ctx.log(`  boot fragment: ${frag}`);
+      ctx.log(`  client log tail:
+${a.logTail?.(40) ?? '(none)'}`);
+    }
     assert.ok(inPublic, 'the player must actually reach the public world before anything is idle');
     ctx.log('  switched to the public world');
 

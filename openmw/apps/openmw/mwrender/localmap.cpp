@@ -66,6 +66,16 @@ namespace MWRender
         osg::Matrix mProjectionMatrix;
         osg::Matrix mViewMatrix;
         bool mActive;
+        // HOW MANY FRAMES THIS CAMERA STILL GETS. It used to be exactly one: the update
+        // callback masked the node off on its second visit, so the map had a single frame in
+        // which to be drawn. That is fine when the first draw definitely happens -- and under
+        // WebGL it may not, because the texture and its framebuffer are created lazily and the
+        // first traversal can be a no-op. The camera is then switched off forever and the map
+        // stays exactly as it was cleared, which is the reported "solid colour" minimap.
+        //
+        // A few frames instead of one. The cost is a handful of extra render-to-texture draws
+        // per cell visited, once; the alternative is a map that never appears at all.
+        int mFramesLeft;
     };
 
     class CameraLocalUpdateCallback
@@ -174,6 +184,15 @@ namespace MWRender
             new LocalMapRenderToTexture(mSceneRoot, mMapResolution, mMapWorldSize, left, top, upVector, zmin, zmax));
 
         mRoot->addChild(mLocalMapRTTs.back());
+        // ...and was one ever created. If this logs and the callback above does not, the node
+        // is in the graph and never visited, which is a cull/traversal fault rather than a
+        // setup one.
+        static bool loggedCreate = false;
+        if (!loggedCreate)
+        {
+            loggedCreate = true;
+            Log(Debug::Warning) << "Local map: RTT camera created and added to the scene";
+        }
 
         MapSegment& segment = mInterior ? mInteriorSegments[std::make_pair(segmentX, segmentY)]
                                         : mExteriorSegments[std::make_pair(segmentX, segmentY)];
@@ -689,6 +708,9 @@ namespace MWRender
         : RTTNode(res, res, 0, false, 0, StereoAwareness::Unaware_MultiViewShaders, shouldAddMSAAIntermediateTarget())
         , mSceneRoot(sceneRoot)
         , mActive(true)
+        // 3: enough to survive a first traversal that draws nothing, small enough that the
+        // extra cost is invisible. See mFramesLeft.
+        , mFramesLeft(3)
     {
         setNodeMask(Mask_RenderToTexture);
 
@@ -716,7 +738,18 @@ namespace MWRender
         SceneUtil::setCameraClearDepth(camera);
         camera->setComputeNearFarMode(osg::Camera::DO_NOT_COMPUTE_NEAR_FAR);
         camera->setReferenceFrame(osg::Camera::ABSOLUTE_RF_INHERIT_VIEWPOINT);
-        camera->setRenderTargetImplementation(osg::Camera::FRAME_BUFFER_OBJECT, osg::Camera::PIXEL_BUFFER_RTT);
+        // NO PIXEL_BUFFER FALLBACK. PIXEL_BUFFER_RTT is a pbuffer, which does not exist under
+        // WebGL at all -- so on this build the second argument names a path that cannot
+        // possibly work, and anything that declines the FBO path lands there and renders
+        // garbage instead of failing loudly. The minimap rendering solid white/blue/black is
+        // exactly that shape, and these three cameras were the only ones in the engine still
+        // naming the fallback; every other RTT here already asks for FRAME_BUFFER_OBJECT
+        // alone.
+        //
+        // Stated honestly: this has not been reproduced, so it is not proven to be the cause.
+        // It is removing a path that provably cannot work on the target platform, which is
+        // worth doing on its own merits.
+        camera->setRenderTargetImplementation(osg::Camera::FRAME_BUFFER_OBJECT);
         camera->setClearColor(osg::Vec4(0.f, 0.f, 0.f, 1.f));
         camera->setClearMask(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         camera->setRenderOrder(osg::Camera::PRE_RENDER);
@@ -770,10 +803,27 @@ namespace MWRender
 
     void CameraLocalUpdateCallback::operator()(LocalMapRenderToTexture* node, osg::NodeVisitor* nv)
     {
-        if (!node->mActive)
+        // DOES THIS EVER RUN. The map camera is created, its texture is real and attached, and
+        // nothing is drawn into it -- so the open question is whether the node is traversed at
+        // all. Four other theories died on the way here (fog, the pbuffer fallback, the
+        // one-frame window, a null texture), each because it was TESTED rather than argued, and
+        // this is the cheapest way to test the one that is left. Once per session.
+        static bool loggedTraversal = false;
+        if (!loggedTraversal)
+        {
+            loggedTraversal = true;
+            Log(Debug::Warning) << "Local map: RTT update callback ran (node IS traversed)";
+        }
+        // Counted DOWN rather than flipped off after one visit, so a first traversal that did
+        // not actually draw (a lazily created FBO under WebGL) does not cost the map its only
+        // chance. mActive is kept because the cleanup pass in cleanupCameras() keys off it.
+        if (node->mFramesLeft > 0)
+            node->mFramesLeft--;
+        else
+        {
             node->setNodeMask(0);
-
-        node->mActive = false;
+            node->mActive = false;
+        }
 
         // Rtt-nodes do not forward update traversal to their cameras so we can traverse safely.
         // Traverse in case there are nested callbacks.
