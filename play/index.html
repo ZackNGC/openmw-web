@@ -1090,8 +1090,12 @@
      if (e.key === 'Tab'){ e.preventDefault(); return; }
      if (mod && (e.key === 's' || e.key === 'S')){ e.preventDefault(); return; }
      if (e.key === 'F5' || (mod && (e.key === 'r' || e.key === 'R'))){
+       // Block the browser reload ONLY. Do not stopPropagation — F5 is OpenMW quicksave
+       // and must still reach SDL. A log line here used to fire on every successful
+       // quicksave and was easy to misread as "the save was blocked".
        e.preventDefault();
-       append('[guard] page reload blocked — use the in-game menu to exit (or close the tab)');
+       if (mod && (e.key === 'r' || e.key === 'R'))
+         append('[guard] page reload blocked — use the in-game menu to exit (or close the tab)');
        return;
      }
      // Focus resilience: typing while the canvas lost focus -> refocus so input reaches the game.
@@ -3468,8 +3472,17 @@
        append('[preRun] env + user dirs ready');
      } catch(e){ append('[preRun error] '+e,'err'); }
    }],
-   print: (t)=>{ console.log(t); append(t); },
-   printErr: (t)=>{ console.warn(t); append(t,'err'); },
+   print: (t)=>{
+     // OSG spam: AlphaFunc is not a GLES op. Groundcover (and some alpha meshes) emit this
+     // hundreds of times per second; writing each to the DOM + console was enough to push a
+     // later F5 quicksave over the wasm/JS heap and abort. Drop them; they are not actionable.
+     if (typeof t === 'string' && t.indexOf('AlphaFunc::apply') !== -1) return;
+     console.log(t); append(t);
+   },
+   printErr: (t)=>{
+     if (typeof t === 'string' && t.indexOf('AlphaFunc::apply') !== -1) return;
+     console.warn(t); append(t,'err');
+   },
    onAbort: function(w){
      append('ABORT: '+w,'err');
      try { if (window.__omwSync) window.__omwSync(); } catch(e){}
