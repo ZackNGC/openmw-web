@@ -92,13 +92,20 @@ const worlds = new WorldSupervisor({
     // satisfied and simpeer.at_cap never fired.
     //
     // So the memory budget is passed too, and capacity() takes the lower of the two. Size a
-    // host by measuring one world+peer on it and setting [worlds] memBudgetMb/worldCostMb —
-    // not from a number in a comment, this one included.
+    // host by measuring on it and setting [worlds] memBudgetMb/worldCostMb/peerCostMb — not
+    // from a number in a comment, this one included.
+    //
+    // peerCostMb is there because the sentence above was itself overtaken: a world no longer
+    // costs "one world+peer" at all. Peers are one per OCCUPIED CELL, so a world's price is
+    // worldCostMb plus peerCostMb for every peer past the first, and the ceiling moves as
+    // players spread out. Measuring one world with one peer and stopping there is how this
+    // box would get undefended a second time, by the same reasoning in a different shape.
     maxWorlds: positiveInt(values['max-worlds'],
       config.worlds.maxWorlds > 0 ? config.worlds.maxWorlds : config.server.maxPlayers,
       'max-worlds'),
     memBudgetMb: config.worlds.memBudgetMb,
     worldCostMb: config.worlds.worldCostMb,
+    peerCostMb: config.worlds.peerCostMb,
     gatewayReserveMb: config.worlds.gatewayReserveMb,
     idleReapMs: positiveInt(values['idle-reap-ms'], 120_000, 'idle-reap-ms'),
     startTimeoutMs: 120_000,
@@ -161,17 +168,25 @@ const directory = await startDirectory({
 // SAY THE CEILING OUT LOUD, AT BOOT. A platform that refuses a world at 03:00 must not be the
 // first time anyone learns what its limit was, and "no memory governor configured" is a
 // condition an operator should be told about rather than discover from an OOM kill.
+//
+// This is the BEST CASE and is logged as such. The memory ceiling is computed from what the
+// running worlds have committed, and a world costs one sim peer per OCCUPIED CELL — so the real
+// ceiling falls as players spread out. The live number is the worlds_capacity gauge, which
+// re-reads capacity() on every scrape; this line is the ceiling on an empty box.
 const cap = worlds.capacity();
 log('info', 'gateway.capacity', {
-  cap: cap.cap,
+  capIfEmpty: cap.cap,
   reason: cap.reason,
   memBudgetMb: config.worlds.memBudgetMb,
   worldCostMb: config.worlds.worldCostMb,
+  peerCostMb: config.worlds.peerCostMb,
   ...(config.worlds.memBudgetMb <= 0
     ? { warning: 'no [worlds] memBudgetMb set: only the count cap applies, and worlds carry a sim peer each' }
     : {}),
 });
 metrics.worldsRunning.addCollector(() => worlds.running);
+metrics.gatewayPeersRunning.addCollector(() => worlds.peersRunning);
+metrics.gatewayCommittedMb.addCollector(() => worlds.committed);
 metrics.worldsCapacity.addCollector(() => {
   const c = worlds.capacity().cap;
   // A gauge must be a number; an unbounded cap renders as 0 ("not governed") rather than
