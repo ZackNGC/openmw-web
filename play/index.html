@@ -391,16 +391,136 @@
            'activeTexture','bindFramebuffer','vertexAttribPointer','enableVertexAttribArray','disableVertexAttribArray',
            'uniform1i','uniform1f','uniform2f','uniform3f','uniform4f','uniform1fv','uniform2fv','uniform3fv',
            'uniform4fv','uniform1iv','uniformMatrix3fv','uniformMatrix4fv','uniformBlockBinding']);
-         METHS.forEach(function(name){
-           var fn = ctx[name]; if (typeof fn !== 'function') return;
-           var isDraw = DRAWS.indexOf(name) !== -1;
-           ctx[name] = function(){ C.total++; if (isDraw) C.draw++; C[name] = (C[name]||0)+1; return fn.apply(this, arguments); };
-         });
-       }
-     }
-     return ctx;
-   };
- })();
+        METHS.forEach(function(name){
+          var fn = ctx[name]; if (typeof fn !== 'function') return;
+          var isDraw = DRAWS.indexOf(name) !== -1;
+          ctx[name] = function(){ C.total++; if (isDraw) C.draw++; C[name] = (C[name]||0)+1; return fn.apply(this, arguments); };
+        });
+      }
+      // DUMMY-ATTRIB DRAW FIX (default ON; ?glfix=0 opts out). The engine draws some meshes
+      // (any model whose merged geometry includes a shape without per-vertex normals) with
+      // osg_Normal ENABLED as an array pointing at a 1-byte dummy buffer. Native desktop GL
+      // reads out of bounds and renders anyway; ANGLE/D3D11 validates and REJECTS the whole
+      // draw (GL_INVALID_OPERATION "vertex buffer is not big enough") — the mesh is silently
+      // invisible while its collision works (vanishing boats/buildings, floating doors).
+      // Correct GL for a constant attribute is a DISABLED array + a current-value constant;
+      // do that transparently: track buffer sizes + per-VAO attrib pointers in JS (no GL
+      // queries on the hot path), and around each draw, constant-ify any enabled attrib
+      // whose backing buffer is tiny (< 16 bytes can't hold one vec3 vertex), then restore
+      // so the engine's cached state stays truthful.
+      if (!/[?&]glfix=0\b/.test(location.search) && !ctx.__glFixed) {
+        ctx.__glFixed = true;
+        (function(){
+          var bufSize = new WeakMap();               // WebGLBuffer -> byte size
+          var vaoState = new WeakMap();              // WebGLVertexArrayObject -> {loc:{buf}}
+          var defaultVao = {};                       // state for VAO null
+          var cur = defaultVao;                      // current VAO's attrib map
+          var curArrayBuf = null;                    // current ARRAY_BUFFER binding
+          var fixed = 0, reported = 0;
+          var _bindBuffer = ctx.bindBuffer;
+          ctx.bindBuffer = function(t, b){ if (t === ctx.ARRAY_BUFFER) curArrayBuf = b; return _bindBuffer.call(this, t, b); };
+          var _bufferData = ctx.bufferData;
+          ctx.bufferData = function(t, d, u){
+            var b = (t === ctx.ARRAY_BUFFER) ? curArrayBuf : null;
+            if (b) bufSize.set(b, (typeof d === 'number') ? d : (d && d.byteLength) || 0);
+            return _bufferData.apply(this, arguments);
+          };
+          var _bindVertexArray = ctx.bindVertexArray;
+          if (_bindVertexArray) ctx.bindVertexArray = function(v){
+            if (v) { var s = vaoState.get(v); if (!s) { s = {}; vaoState.set(v, s); } cur = s; }
+            else cur = defaultVao;
+            return _bindVertexArray.call(this, v);
+          };
+          function pointer(loc){ var a = cur[loc]; if (!a) { a = {buf:null, en:false}; cur[loc] = a; } return a; }
+          var _vap = ctx.vertexAttribPointer;
+          ctx.vertexAttribPointer = function(loc){ pointer(loc).buf = curArrayBuf; return _vap.apply(this, arguments); };
+          var _vapI = ctx.vertexAttribIPointer;
+          if (_vapI) ctx.vertexAttribIPointer = function(loc){ pointer(loc).buf = curArrayBuf; return _vapI.apply(this, arguments); };
+          var _en = ctx.enableVertexAttribArray;
+          ctx.enableVertexAttribArray = function(loc){ pointer(loc).en = true; return _en.call(this, loc); };
+          var _dis = ctx.disableVertexAttribArray;
+          ctx.disableVertexAttribArray = function(loc){ pointer(loc).en = false; return _dis.call(this, loc); };
+          function guard(fn){
+            return function(){
+              var patched = null;
+              for (var k in cur) {
+                var a = cur[k];
+                if (a.en && a.buf) {
+                  var sz = bufSize.get(a.buf);
+                  if (sz !== undefined && sz < 16) {
+                    (patched = patched || []).push(k);
+                    _dis.call(ctx, +k);
+                    ctx.vertexAttrib4f(+k, 0, 0, 1, 1);   // benign constant (normal-ish)
+                  }
+                }
+              }
+              var r = fn.apply(this, arguments);
+              if (patched) {
+                for (var i3 = 0; i3 < patched.length; i3++) _en.call(ctx, +patched[i3]);
+                fixed++;
+                if (reported < 3 && window.__omwLog) { reported++;
+                  window.__omwLog('[glfix] constant-ified dummy attrib(s) loc ' + patched.join(',')
+                    + ' for a draw ANGLE would reject (total draws fixed: ' + fixed + ')'); }
+              }
+              return r;
+            };
+          }
+          ['drawElements','drawArrays','drawElementsInstanced','drawArraysInstanced','drawRangeElements']
+            .forEach(function(n){ if (typeof ctx[n] === 'function') ctx[n] = guard(ctx[n]); });
+          window.__glFixCount = function(){ return fixed; };
+        })();
+      }
+      // ?gltrap=1 (QA): catch the draws ANGLE rejects ("vertex buffer not big enough" ->
+      // GL_INVALID_OPERATION -> mesh silently invisible). After every draw, poll getError;
+      // on error dump the draw args + every enabled attrib's buffer size/stride/offset +
+      // index buffer size, dedup by signature. Slow (sync getError per draw) — QA only.
+      if (/[?&]gltrap=1\b/.test(location.search) && !ctx.__glTrapped) {
+        ctx.__glTrapped = true;
+        window.__glTrapHits = {};
+        var seen = window.__glTrapHits, hits = 0;
+        var DRAWS2 = ['drawElements','drawArrays','drawElementsInstanced','drawArraysInstanced','drawRangeElements'];
+        DRAWS2.forEach(function(name){
+          var fn = ctx[name]; if (typeof fn !== 'function') return;
+          ctx[name] = function(){
+            var r = fn.apply(this, arguments);
+            if (hits >= 40) return r;         // enough evidence; stop paying for getError
+            var err = ctx.getError();
+            if (err) {
+              try {
+                var a = Array.prototype.slice.call(arguments);
+                var prog = ctx.getParameter(ctx.CURRENT_PROGRAM);
+                var nat = prog ? ctx.getProgramParameter(prog, ctx.ACTIVE_ATTRIBUTES) : 0;
+                var attribs = [];
+                for (var i2 = 0; i2 < nat; i2++) {
+                  var info = ctx.getActiveAttrib(prog, i2);
+                  var loc = ctx.getAttribLocation(prog, info.name);
+                  if (loc < 0) continue;
+                  var en = ctx.getVertexAttrib(loc, ctx.VERTEX_ATTRIB_ARRAY_ENABLED);
+                  var buf = ctx.getVertexAttrib(loc, ctx.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING);
+                  var bsz = -1;
+                  if (buf) { var pb = ctx.getParameter(ctx.ARRAY_BUFFER_BINDING);
+                             ctx.bindBuffer(ctx.ARRAY_BUFFER, buf);
+                             bsz = ctx.getBufferParameter(ctx.ARRAY_BUFFER, ctx.BUFFER_SIZE);
+                             ctx.bindBuffer(ctx.ARRAY_BUFFER, pb); }
+                  attribs.push(info.name + '(loc' + loc + (en ? '' : ' DISABLED') + ' sz' + bsz
+                    + ' str' + ctx.getVertexAttrib(loc, ctx.VERTEX_ATTRIB_ARRAY_STRIDE)
+                    + ' div' + ctx.getVertexAttrib(loc, ctx.VERTEX_ATTRIB_ARRAY_DIVISOR) + ')');
+                }
+                var ib = ctx.getParameter(ctx.ELEMENT_ARRAY_BUFFER_BINDING);
+                var ibsz = ib ? ctx.getBufferParameter(ctx.ELEMENT_ARRAY_BUFFER, ctx.BUFFER_SIZE) : -1;
+                var sig = name + '(' + a.join(',') + ') ib=' + ibsz + ' attribs=' + attribs.join(' ');
+                if (!seen[sig]) { seen[sig] = 0; console.warn('[gltrap] err=0x' + err.toString(16) + ' ' + sig); }
+                seen[sig]++; hits++;
+              } catch (e3) { console.warn('[gltrap] dump failed: ' + e3); }
+            }
+            return r;
+          };
+        });
+      }
+    }
+    return ctx;
+  };
+})();
  const logEl = document.getElementById('log');
  let started = false;
  // HRTF binaural spatialization: emscripten's OpenAL positions sources with PannerNodes
