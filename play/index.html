@@ -1094,7 +1094,10 @@
    arguments: (function(){
      try {
        var m = /[?&]start=([^&]+)/.exec(location.search);
-       if (m) return ['--skip-menu', '--start', decodeURIComponent(m[1])];
+       // ?scriptrun=<uri-encoded console commands> (QA aid): batch executed on game start via
+       // --script-run (file written in preRun). Camera/teleport control for headless testing.
+       var sr = /[?&]scriptrun=([^&]+)/.exec(location.search) ? ['--script-run', '/qa-script.txt'] : [];
+       if (m) return ['--skip-menu', '--start', decodeURIComponent(m[1])].concat(sr);
        // Multiplayer boot: never show the title menu — the launcher's character loader IS the
        // menu now. Keyed on ?mp= (survives a reload; the fragment gets scrubbed) so a reload
        // rejoins straight in-world via the parked resume token instead of dead-ending at the
@@ -1124,6 +1127,11 @@
        // ?start=<cell> (deep-link) => auto-complete chargen so the new game drops straight into
        // the target cell (see Module.arguments above + charactercreation.cpp). QA aid only.
        if (/[?&]start=/.test(location.search)) ENV.OPENMW_QA_AUTOCHARGEN='1';
+       // ?scriptrun (QA): write the console batch --script-run points at (see arguments above).
+       try {
+         var __sr = /[?&]scriptrun=([^&]+)/.exec(location.search);
+         if (__sr) FS.writeFile('/qa-script.txt', decodeURIComponent(__sr[1]));
+       } catch(e){ append('[qa scriptrun err] '+e,'err'); }
        // ?forcemrt (QA) reproduces the pre-fix pass-normals-MRT indexed-blend bug (opaque-black
        // smoke) for A/B comparison. Never used in normal play.
        if (/[?&]forcemrt\b/.test(location.search)) ENV.OMW_FORCE_NORMALS_RT='1';
