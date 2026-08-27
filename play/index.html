@@ -2206,6 +2206,40 @@
           });
           FS.writeFile('/settings.cfg', lines.join('\n') + '\n');
           append('[momw] merged curated settings defaults (groundcover/postfx/etc.)');
+          // Pin memory/stability keys onto the persisted user file. After the first session
+          // the engine writes a full settings.cfg to IDBFS which would otherwise override
+          // these defaults — silt-strider travel then keeps the current city AND preloads
+          // the destination and aborts at the 4GB wasm ceiling.
+          try {
+            var ucfg = '/userdata/config/openmw/settings.cfg';
+            if (FS.analyzePath(ucfg).exists) {
+              var PIN = {
+                Groundcover: ['enabled'],
+                Navigator: ['max tiles number'],
+                Camera: ['viewing distance'],
+                Cells: ['preload enabled','preload exterior grid','preload doors',
+                        'preload fast travel','preload cell cache max'],
+                Saves: ['autosave'],
+                Terrain: ['object paging','object paging active grid'],
+                'Post Processing': ['chain']
+              };
+              var u = parseIni(FS.readFile(ucfg, {encoding:'utf8'}));
+              Object.keys(PIN).forEach(function(sec){
+                if (!add.map[sec]) return;
+                if (!u.map[sec]){ u.map[sec] = {}; u.order.push(sec); }
+                PIN[sec].forEach(function(k){
+                  if (add.map[sec][k] != null) u.map[sec][k] = add.map[sec][k];
+                });
+              });
+              var ulines = [];
+              u.order.forEach(function(sec){
+                ulines.push('['+sec+']');
+                Object.keys(u.map[sec]).forEach(function(k){ ulines.push(k+' = '+u.map[sec][k]); });
+              });
+              FS.writeFile(ucfg, ulines.join('\n') + '\n');
+              append('[momw] pinned web memory caps over saved user settings');
+            }
+          } catch(e2){ append('[momw] user-settings pin failed: '+e2,'err'); }
         } catch(e){ append('[momw] settings merge failed: '+e, 'err'); }
       }
 
